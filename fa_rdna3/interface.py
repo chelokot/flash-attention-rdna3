@@ -16,9 +16,24 @@ from .kernels import (
     _attention_bwd_preprocess,
     _attention_bwd_dkdv,
     _attention_bwd_dq,
+    _attention_split,
+    _attention_combine,
 )
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256)
+
+# gfx1100 (RX 7900 XTX) has 96 compute units; aim to launch a couple of
+# workgroups per CU so a tiny-query decode saturates the machine.
+_DECODE_TARGET_PROGRAMS = 192
+_DECODE_BLOCK_M = 16
+
+
+def _decode_num_splits(batch, heads, seqlen_q, seqlen_k):
+    m_blocks = triton.cdiv(seqlen_q, _DECODE_BLOCK_M)
+    base = batch * heads * m_blocks
+    wanted = (_DECODE_TARGET_PROGRAMS + base - 1) // base
+    key_blocks = triton.cdiv(seqlen_k, 64)
+    return max(1, min(32, wanted, key_blocks))
 
 
 def _forward(query, key, value, causal, softmax_scale):
@@ -143,3 +158,53 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None):
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     return _FlashAttention.apply(query, key, value, causal, softmax_scale)
+
+
+def flash_attention_decode(query, key, value, softmax_scale=None):
+    """Split-K attention for autoregressive decode (small query, long KV).
+
+    Splits the key/value cache across workgroups so a tiny query saturates the
+    GPU instead of leaving one workgroup to walk the whole cache, then merges the
+    partial results with an LSE reduction. Non-causal (the cache holds exactly
+    the visible keys) and inference-only (not differentiable).
+    """
+    batch, heads, seqlen_q, head_dim = query.shape
+    seqlen_k = key.shape[2]
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim {head_dim} not supported; expected one of {_SUPPORTED_HEAD_DIMS}")
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported dtype {query.dtype}; expected float16 or bfloat16")
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    num_splits = _decode_num_splits(batch, heads, seqlen_q, seqlen_k)
+    o_partial = torch.empty((num_splits, batch, heads, seqlen_q, head_dim),
+                            dtype=torch.float32, device=query.device)
+    lse_partial = torch.empty((num_splits, batch, heads, seqlen_q),
+                              dtype=torch.float32, device=query.device)
+    out = torch.empty_like(query)
+
+    split_grid = lambda meta: (num_splits, triton.cdiv(seqlen_q, _DECODE_BLOCK_M), batch * heads)
+    _attention_split[split_grid](
+        query, key, value, o_partial, lse_partial,
+        softmax_scale,
+        query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+        key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+        value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+        o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3), o_partial.stride(4),
+        lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2), lse_partial.stride(3),
+        heads, seqlen_q, seqlen_k, triton.next_power_of_2(seqlen_k), num_splits,
+        HEAD_DIM=head_dim, BLOCK_M=_DECODE_BLOCK_M,
+    )
+
+    combine_grid = lambda meta: (triton.cdiv(seqlen_q, 64), batch * heads)
+    _attention_combine[combine_grid](
+        o_partial, lse_partial, out,
+        o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3), o_partial.stride(4),
+        lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2), lse_partial.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        heads, seqlen_q, num_splits,
+        HEAD_DIM=head_dim, BLOCK_M=64,
+    )
+    return out
