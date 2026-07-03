@@ -12,10 +12,19 @@ diagonal band and the ragged tail). The unmasked region carries no ``tl.where``
 and no boundary-guarded loads, which is where most iterations live.
 """
 
+import functools
+
 import triton
 import triton.language as tl
+from triton.testing import do_bench
 
 LOG2E = tl.constexpr(1.44269504088896)  # log2(e); folded into the scale so softmax uses exp2
+
+# Rank configs over more repetitions than the Triton default: on a consumer
+# RX 7900 XTX the per-config timing is noisy enough that a single warmup can
+# lock in a config ~30% off the best, so the extra reps pay for themselves in
+# stable selection.
+_autotune_bench = functools.partial(do_bench, warmup=40, rep=120)
 
 
 # (BLOCK_M, BLOCK_N, num_warps) geometries that miscompile in the ROCm Triton
@@ -97,7 +106,11 @@ def _attention_inner(
     return acc, l_i, m_i
 
 
-@triton.autotune(configs=_fwd_configs(), key=["seqlen_q", "seqlen_k", "HEAD_DIM", "IS_CAUSAL"])
+@triton.autotune(
+    configs=_fwd_configs(),
+    key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+    do_bench=_autotune_bench,
+)
 @triton.jit
 def _attention_forward(
     q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr,
@@ -108,6 +121,7 @@ def _attention_forward(
     stride_ob, stride_oh, stride_om, stride_od,
     stride_lb, stride_lh, stride_lm,
     num_heads, seqlen_q, seqlen_k,
+    seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,

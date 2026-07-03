@@ -39,6 +39,7 @@ def launch(q, k, v, causal, scale, block_m, block_n, num_warps):
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         heads, seqlen_q, seqlen_k,
+        triton.next_power_of_2(seqlen_q), triton.next_power_of_2(seqlen_k),
         HEAD_DIM=head_dim, BLOCK_M=block_m, BLOCK_N=block_n, IS_CAUSAL=causal,
         num_warps=num_warps, num_stages=1,
     )

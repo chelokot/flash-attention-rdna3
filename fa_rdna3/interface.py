@@ -55,6 +55,7 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None):
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         heads, seqlen_q, seqlen_k,
+        triton.next_power_of_2(seqlen_q), triton.next_power_of_2(seqlen_k),
         HEAD_DIM=head_dim,
         IS_CAUSAL=causal,
     )
