@@ -23,6 +23,25 @@ def test_dispatch_matches_reference_and_restores():
     torch.testing.assert_close(dispatched.float(), baseline.float(), atol=3e-3, rtol=3e-3)
 
 
+def test_dispatch_routes_decode():
+    # A one-row query against a long cache with grad disabled must route to the
+    # split-K decode path and still match the reference.
+    query = torch.randn(1, 8, 1, 128, device="cuda", dtype=torch.float16)
+    key = torch.randn(1, 8, 8192, 128, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+
+    reference = F.scaled_dot_product_attention(query, key, value)
+
+    enable_rdna3_flash_attention()
+    try:
+        with torch.no_grad():
+            result = F.scaled_dot_product_attention(query, key, value)
+    finally:
+        disable_rdna3_flash_attention()
+
+    torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
+
+
 def test_dispatch_falls_back_for_unsupported_head_dim():
     # head_dim 96 is unsupported by the kernel; the dispatcher must defer to the original.
     query = torch.randn(1, 4, 256, 96, device="cuda", dtype=torch.float16)

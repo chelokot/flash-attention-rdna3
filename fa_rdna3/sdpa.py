@@ -9,9 +9,14 @@ cases it supports, and defers to the original implementation otherwise.
 import torch
 import torch.nn.functional as F
 
-from .interface import flash_attention, _SUPPORTED_HEAD_DIMS
+from .interface import flash_attention, flash_attention_decode, _SUPPORTED_HEAD_DIMS
 
 _original_sdpa = None
+
+# Below this many query rows against a long enough cache, split-K decode wins by
+# fanning the cache across the GPU instead of one workgroup per (batch, head).
+_DECODE_MAX_QUERY = 8
+_DECODE_MIN_KEY = 1024
 
 
 def _is_supported(query, key, value, attn_mask, dropout_p):
@@ -31,6 +36,10 @@ def _is_supported(query, key, value, attn_mask, dropout_p):
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
     if not enable_gqa and _is_supported(query, key, value, attn_mask, dropout_p):
+        if (not is_causal and not torch.is_grad_enabled()
+                and query.shape[-2] <= _DECODE_MAX_QUERY
+                and key.shape[-2] >= _DECODE_MIN_KEY):
+            return flash_attention_decode(query, key, value, softmax_scale=scale)
         return flash_attention(query, key, value, causal=is_causal, softmax_scale=scale)
     return _original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                           is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
