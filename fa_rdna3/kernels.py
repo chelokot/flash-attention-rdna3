@@ -183,3 +183,199 @@ def _attention_forward(
     lse_base = lse_ptr + batch_idx * stride_lb + head_idx * stride_lh
     lse_ptrs = lse_base + offs_m * stride_lm
     tl.store(lse_ptrs, lse, mask=offs_m < seqlen_q)
+
+
+def _bwd_configs():
+    # The dK/dV and dQ kernels carry more live fp32 accumulators than the
+    # forward (two head-dim tiles plus the score tile), so the same blacklist
+    # applies and small tiles dominate. Reuse the validated forward geometries.
+    return _fwd_configs()
+
+
+@triton.jit
+def _attention_bwd_preprocess(
+    out_ptr, dout_ptr, delta_ptr,
+    stride_ob, stride_oh, stride_om, stride_od,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_db, stride_dh, stride_dm,
+    num_heads, seqlen_q,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
+):
+    """delta_i = sum_d O_id * dO_id, the per-row correction used by dS."""
+    block_m_idx = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch_idx = (batch_head // num_heads).to(tl.int64)
+    head_idx = (batch_head % num_heads).to(tl.int64)
+
+    offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    row_mask = offs_m[:, None] < seqlen_q
+
+    o_ptrs = (out_ptr + batch_idx * stride_ob + head_idx * stride_oh
+              + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
+    do_ptrs = (dout_ptr + batch_idx * stride_dob + head_idx * stride_doh
+               + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod)
+    o = tl.load(o_ptrs, mask=row_mask, other=0.0).to(tl.float32)
+    do = tl.load(do_ptrs, mask=row_mask, other=0.0).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+
+    delta_ptrs = delta_ptr + batch_idx * stride_db + head_idx * stride_dh + offs_m * stride_dm
+    tl.store(delta_ptrs, delta, mask=offs_m < seqlen_q)
+
+
+@triton.autotune(configs=_bwd_configs(),
+                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+                 do_bench=_autotune_bench)
+@triton.jit
+def _attention_bwd_dkdv(
+    q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dk_ptr, dv_ptr,
+    softmax_scale,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_lb, stride_lh, stride_lm,
+    stride_deb, stride_deh, stride_dem,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    num_heads, seqlen_q, seqlen_k,
+    seqlen_q_bucket, seqlen_k_bucket,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """One key block per program; accumulate dK, dV by looping over query blocks.
+
+    Scores are held transposed as [BLOCK_N, BLOCK_M] so no probability tile is
+    transposed between matmuls. P is recomputed from Q, K and the stored LSE:
+    ``P = exp2(scale*log2(e) * QK^T - log2(e) * LSE)``.
+    """
+    block_n_idx = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch_idx = (batch_head // num_heads).to(tl.int64)
+    head_idx = (batch_head % num_heads).to(tl.int64)
+
+    qk_scale = softmax_scale * LOG2E
+    offs_n = block_n_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    k_ptrs = (k_ptr + batch_idx * stride_kb + head_idx * stride_kh
+              + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+    v_ptrs = (v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+              + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+    n_mask = offs_n[:, None] < seqlen_k
+    k = tl.load(k_ptrs, mask=n_mask, other=0.0)
+    v = tl.load(v_ptrs, mask=n_mask, other=0.0)
+
+    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+    q_base = q_ptr + batch_idx * stride_qb + head_idx * stride_qh
+    do_base = dout_ptr + batch_idx * stride_dob + head_idx * stride_doh
+    lse_base = lse_ptr + batch_idx * stride_lb + head_idx * stride_lh
+    delta_base = delta_ptr + batch_idx * stride_deb + head_idx * stride_deh
+
+    # Only queries at or below this key block contribute under a causal mask.
+    start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
+
+    for m in range(start_m, seqlen_q, BLOCK_M):
+        offs_m = m + tl.arange(0, BLOCK_M)
+        q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        do_ptrs = do_base + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        m_mask = offs_m[:, None] < seqlen_q
+        q = tl.load(q_ptrs, mask=m_mask, other=0.0)
+        do = tl.load(do_ptrs, mask=m_mask, other=0.0)
+        lse = tl.load(lse_base + offs_m * stride_lm, mask=offs_m < seqlen_q, other=0.0)
+        delta = tl.load(delta_base + offs_m * stride_dem, mask=offs_m < seqlen_q, other=0.0)
+
+        qkT = tl.dot(k, tl.trans(q))
+        pT = tl.exp2(qkT * qk_scale - lse[None, :] * LOG2E)
+        keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
+        if IS_CAUSAL:
+            keep = keep & (offs_m[None, :] >= offs_n[:, None])
+        pT = tl.where(keep, pT, 0.0)
+
+        dv += tl.dot(pT.to(do.dtype), do)
+        dpT = tl.dot(v, tl.trans(do))
+        dsT = pT * (dpT - delta[None, :])
+        dk += tl.dot(dsT.to(q.dtype), q)
+
+    dk *= softmax_scale
+    dk_ptrs = (dk_ptr + batch_idx * stride_dkb + head_idx * stride_dkh
+               + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd)
+    dv_ptrs = (dv_ptr + batch_idx * stride_dvb + head_idx * stride_dvh
+               + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd)
+    tl.store(dk_ptrs, dk.to(dk_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
+    tl.store(dv_ptrs, dv.to(dv_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
+
+
+@triton.autotune(configs=_bwd_configs(),
+                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+                 do_bench=_autotune_bench)
+@triton.jit
+def _attention_bwd_dq(
+    q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dq_ptr,
+    softmax_scale,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_lb, stride_lh, stride_lm,
+    stride_deb, stride_deh, stride_dem,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    num_heads, seqlen_q, seqlen_k,
+    seqlen_q_bucket, seqlen_k_bucket,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """One query block per program; accumulate dQ by looping over key blocks."""
+    block_m_idx = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch_idx = (batch_head // num_heads).to(tl.int64)
+    head_idx = (batch_head % num_heads).to(tl.int64)
+
+    qk_scale = softmax_scale * LOG2E
+    offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    m_mask = offs_m[:, None] < seqlen_q
+
+    q_ptrs = (q_ptr + batch_idx * stride_qb + head_idx * stride_qh
+              + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    do_ptrs = (dout_ptr + batch_idx * stride_dob + head_idx * stride_doh
+               + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod)
+    q = tl.load(q_ptrs, mask=m_mask, other=0.0)
+    do = tl.load(do_ptrs, mask=m_mask, other=0.0)
+    lse = tl.load(lse_ptr + batch_idx * stride_lb + head_idx * stride_lh + offs_m * stride_lm,
+                  mask=offs_m < seqlen_q, other=0.0)
+    delta = tl.load(delta_ptr + batch_idx * stride_deb + head_idx * stride_deh + offs_m * stride_dem,
+                    mask=offs_m < seqlen_q, other=0.0)
+
+    dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    k_base = k_ptr + batch_idx * stride_kb + head_idx * stride_kh
+    v_base = v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+
+    max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M) if IS_CAUSAL else seqlen_k
+
+    for n in range(0, max_n, BLOCK_N):
+        offs_n = n + tl.arange(0, BLOCK_N)
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        n_mask = offs_n[:, None] < seqlen_k
+        k = tl.load(k_ptrs, mask=n_mask, other=0.0)
+        v = tl.load(v_ptrs, mask=n_mask, other=0.0)
+
+        qk = tl.dot(q, tl.trans(k))
+        p = tl.exp2(qk * qk_scale - lse[:, None] * LOG2E)
+        keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        if IS_CAUSAL:
+            keep = keep & (offs_m[:, None] >= offs_n[None, :])
+        p = tl.where(keep, p, 0.0)
+
+        dp = tl.dot(do, tl.trans(v))
+        ds = p * (dp - delta[:, None])
+        dq += tl.dot(ds.to(k.dtype), k)
+
+    dq *= softmax_scale
+    dq_ptrs = (dq_ptr + batch_idx * stride_dqb + head_idx * stride_dqh
+               + offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd)
+    tl.store(dq_ptrs, dq.to(dq_ptr.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)

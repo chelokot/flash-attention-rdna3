@@ -28,10 +28,14 @@ def timed(fn, iters=50, warmup=10):
     return start.elapsed_time(end) / iters
 
 
-def tflops(batch, heads, seqlen, head_dim, causal, ms):
+def fwd_flops(batch, heads, seqlen, head_dim, causal):
     flops = 2 * 2 * batch * heads * seqlen * seqlen * head_dim
     if causal:
         flops //= 2
+    return flops
+
+
+def tflops(flops, ms):
     return flops / (ms * 1e-3) / 1e12
 
 
@@ -41,8 +45,8 @@ def main():
     args = parser.parse_args()
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
 
-    print(f"{'shape':>28} {'causal':>7} {'torch ms':>10} {'triton ms':>10} "
-          f"{'speedup':>8} {'triton TFLOP/s':>15}")
+    print(f"{'shape':>28} {'causal':>7} {'fwd ms':>8} {'fwd TF/s':>9} "
+          f"{'bwd ms':>8} {'bwd TF/s':>9} {'vs torch':>9}")
     configs = [
         (1, 32, 1024, 128),
         (2, 16, 2048, 128),
@@ -53,15 +57,22 @@ def main():
     for causal in (False, True):
         for batch, heads, seqlen, head_dim in configs:
             shape = (batch, heads, seqlen, head_dim)
-            q = torch.randn(shape, device="cuda", dtype=dtype)
-            k = torch.randn(shape, device="cuda", dtype=dtype)
-            v = torch.randn(shape, device="cuda", dtype=dtype)
+            q = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+            k = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+            v = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+            dout = torch.randn(shape, device="cuda", dtype=dtype)
 
             torch_ms = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=causal))
-            triton_ms = timed(lambda: flash_attention(q, k, v, causal=causal))
+            fwd_ms = timed(lambda: flash_attention(q, k, v, causal=causal))
+
+            out = flash_attention(q, k, v, causal=causal)
+            bwd_ms = timed(lambda: out.backward(dout, retain_graph=True))
+
+            fflops = fwd_flops(batch, heads, seqlen, head_dim, causal)
+            bflops = int(2.5 * fflops)  # standard FA convention: backward ~2.5x forward
             label = f"b{batch} h{heads} s{seqlen} d{head_dim}"
-            print(f"{label:>28} {str(causal):>7} {torch_ms:>10.3f} {triton_ms:>10.3f} "
-                  f"{torch_ms / triton_ms:>7.2f}x {tflops(batch, heads, seqlen, head_dim, causal, triton_ms):>14.1f}")
+            print(f"{label:>28} {str(causal):>7} {fwd_ms:>8.3f} {tflops(fflops, fwd_ms):>9.1f} "
+                  f"{bwd_ms:>8.3f} {tflops(bflops, bwd_ms):>9.1f} {torch_ms / fwd_ms:>8.2f}x")
 
 
 if __name__ == "__main__":
