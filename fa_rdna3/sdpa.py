@@ -1,9 +1,9 @@
-"""Drop-in ``scaled_dot_product_attention`` replacement for RDNA3.
+"""Drop-in ``scaled_dot_product_attention`` backend for RDNA3.
 
-Importing :func:`enable_rdna3_flash_attention` patches
+Calling :func:`enable_rdna3_flash_attention` installs an override of
 ``torch.nn.functional.scaled_dot_product_attention`` so existing code
 (ComfyUI, diffusers, transformers) transparently uses the Triton kernel for the
-cases it supports, and falls back to the original implementation otherwise.
+cases it supports, and defers to the original implementation otherwise.
 """
 
 import torch
@@ -28,7 +28,7 @@ def _is_supported(query, key, value, attn_mask, dropout_p):
     )
 
 
-def _patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
     if not enable_gqa and _is_supported(query, key, value, attn_mask, dropout_p):
         return flash_attention(query, key, value, causal=is_causal, softmax_scale=scale)
@@ -41,7 +41,7 @@ def enable_rdna3_flash_attention():
     global _original_sdpa
     if _original_sdpa is None:
         _original_sdpa = F.scaled_dot_product_attention
-        F.scaled_dot_product_attention = _patched_sdpa
+        F.scaled_dot_product_attention = _dispatch_sdpa
 
 
 def disable_rdna3_flash_attention():

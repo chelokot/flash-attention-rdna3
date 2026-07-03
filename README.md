@@ -58,9 +58,9 @@ v = torch.randn_like(q)
 out = flash_attention(q, k, v, causal=True)
 ```
 
-Transparent drop-in for ComfyUI / diffusers / transformers — patches
-`torch.nn.functional.scaled_dot_product_attention` and falls back to the
-original for anything unsupported (attention masks, GQA, fp32, exotic head
+Transparent drop-in for ComfyUI / diffusers / transformers — installs an
+override of `torch.nn.functional.scaled_dot_product_attention` and defers to
+the original for anything unsupported (attention masks, GQA, fp32, exotic head
 dims):
 
 ```python
