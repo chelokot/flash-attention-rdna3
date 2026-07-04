@@ -73,10 +73,13 @@ def _attention_inner(
         offs_n = start + tl.arange(0, BLOCK_N)
 
         k_ptrs = k_base + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
+        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
         if MASKED:
             k = tl.load(k_ptrs, mask=offs_n[None, :] < seqlen_k, other=0.0)
+            v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
         else:
             k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
 
         qk = tl.dot(q, k)
 
@@ -94,11 +97,6 @@ def _attention_inner(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
-        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        if MASKED:
-            v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
-        else:
-            v = tl.load(v_ptrs)
         acc += tl.dot(p.to(v.dtype), v)
 
         m_i = m_new
