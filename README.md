@@ -32,7 +32,7 @@ what you actually get out of the box on RDNA3):
 The gap widens with sequence length — the win is largest exactly where the
 quadratic math path hurts most (long context, high-resolution diffusion).
 
-**Absolute forward throughput** is 31–40 TFLOP/s (head_dim 128) and 26–36
+**Absolute forward throughput** is 33–42 TFLOP/s (head_dim 128) and 26–37
 TFLOP/s causal, against a measured ceiling of ~70 TFLOP/s for an optimal pure
 WMMA GEMM on this card (`bench/gemm_ceiling.py`; the 123 TFLOP/s marketing peak
 assumes dual-issue that does not occur in real kernels). Backward runs at 15–22
@@ -145,6 +145,8 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels.py`:
 - The exponentials use `exp2` with `log2(e)` folded into the softmax scale (and
   applied to `q` once before the loop), which maps to a native RDNA3
   instruction.
+- V is loaded at the top of the key loop, before the QK dot, so its global-load
+  latency overlaps the QK matmul and the softmax (+3–7% at head_dim 128).
 - The inner key loop is split into an unmasked region (full tiles below the
   causal diagonal / before the key boundary) and a masked region (diagonal band
   and ragged tail), so the common path carries no `tl.where` and no
