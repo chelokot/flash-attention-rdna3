@@ -36,9 +36,19 @@ def _decode_num_splits(batch, heads, seqlen_q, seqlen_k):
     return max(1, min(32, wanted, key_blocks))
 
 
+def _check_head_groups(query, key, value):
+    q_heads, kv_heads, v_heads = query.shape[1], key.shape[1], value.shape[1]
+    if kv_heads != v_heads:
+        raise ValueError(f"key heads {kv_heads} must equal value heads {v_heads}")
+    if q_heads % kv_heads != 0:
+        raise ValueError(
+            f"query heads {q_heads} must be a multiple of key/value heads {kv_heads} (grouped-query attention)")
+
+
 def _forward(query, key, value, causal, softmax_scale):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
+    group_size = heads // key.shape[1]
 
     out = torch.empty_like(query)
     lse = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=query.device)
@@ -56,6 +66,7 @@ def _forward(query, key, value, causal, softmax_scale):
         triton.next_power_of_2(seqlen_q), triton.next_power_of_2(seqlen_k),
         HEAD_DIM=head_dim,
         IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
     )
     return out, lse
 
@@ -63,6 +74,8 @@ def _forward(query, key, value, causal, softmax_scale):
 def _backward(dout, query, key, value, out, lse, causal, softmax_scale):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
+    kv_heads = key.shape[1]
+    group_size = heads // kv_heads
     dout = dout.contiguous()
 
     delta = torch.empty_like(lse)
@@ -83,7 +96,7 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale):
         HEAD_DIM=head_dim, BLOCK_M=128,
     )
 
-    dkdv_grid = lambda meta: (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * heads)
+    dkdv_grid = lambda meta: (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * kv_heads)
     _attention_bwd_dkdv[dkdv_grid](
         query, key, value, dout, lse, delta, dkey, dvalue,
         softmax_scale,
@@ -95,8 +108,8 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale):
         delta.stride(0), delta.stride(1), delta.stride(2),
         dkey.stride(0), dkey.stride(1), dkey.stride(2), dkey.stride(3),
         dvalue.stride(0), dvalue.stride(1), dvalue.stride(2), dvalue.stride(3),
-        heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
-        HEAD_DIM=head_dim, IS_CAUSAL=causal,
+        kv_heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
+        HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
     )
 
     dq_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
@@ -111,7 +124,7 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale):
         delta.stride(0), delta.stride(1), delta.stride(2),
         dquery.stride(0), dquery.stride(1), dquery.stride(2), dquery.stride(3),
         heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
-        HEAD_DIM=head_dim, IS_CAUSAL=causal,
+        HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
     )
     return dquery, dkey, dvalue
 
@@ -153,6 +166,7 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None):
     for name, tensor in (("key", key), ("value", value)):
         if tensor.dtype != query.dtype:
             raise ValueError(f"{name} dtype {tensor.dtype} does not match query dtype {query.dtype}")
+    _check_head_groups(query, key, value)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -174,6 +188,8 @@ def flash_attention_decode(query, key, value, softmax_scale=None):
         raise ValueError(f"head_dim {head_dim} not supported; expected one of {_SUPPORTED_HEAD_DIMS}")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported dtype {query.dtype}; expected float16 or bfloat16")
+    _check_head_groups(query, key, value)
+    group_size = heads // key.shape[1]
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -195,7 +211,7 @@ def flash_attention_decode(query, key, value, softmax_scale=None):
         o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3), o_partial.stride(4),
         lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2), lse_partial.stride(3),
         heads, seqlen_q, seqlen_k, triton.next_power_of_2(seqlen_k), num_splits,
-        HEAD_DIM=head_dim, BLOCK_M=_DECODE_BLOCK_M,
+        HEAD_DIM=head_dim, BLOCK_M=_DECODE_BLOCK_M, GROUP_SIZE=group_size,
     )
 
     combine_grid = lambda meta: (triton.cdiv(seqlen_q, 64), batch * heads)

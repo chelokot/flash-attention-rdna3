@@ -95,7 +95,7 @@ out = flash_attention_decode(q_step, k_cache, v_cache)  # q_step is (b, h, 1, d)
 
 Transparent drop-in for ComfyUI / diffusers / transformers — installs an
 override of `torch.nn.functional.scaled_dot_product_attention` and defers to
-the original for anything unsupported (attention masks, GQA, fp32, exotic head
+the original for anything unsupported (attention masks, fp32, exotic head
 dims):
 
 ```python
@@ -110,6 +110,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - fp16 and bf16
 - Causal and full (bidirectional) attention
 - Distinct query / key sequence lengths (cross-attention)
+- Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)
 - Split-K decode for the small-query / long-KV regime
 

@@ -28,6 +28,8 @@ def _is_supported(query, key, value, attn_mask, dropout_p):
         and key.shape[-1] == query.shape[-1]
         and value.shape[-1] == query.shape[-1]
         and key.shape[-2] == value.shape[-2]
+        and key.shape[-3] == value.shape[-3]
+        and query.shape[-3] % key.shape[-3] == 0  # grouped-query: q heads divisible by kv heads
         and attn_mask is None
         and dropout_p == 0.0
     )
@@ -35,7 +37,7 @@ def _is_supported(query, key, value, attn_mask, dropout_p):
 
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
-    if not enable_gqa and _is_supported(query, key, value, attn_mask, dropout_p):
+    if _is_supported(query, key, value, attn_mask, dropout_p):
         if (not is_causal and not torch.is_grad_enabled()
                 and query.shape[-2] <= _DECODE_MAX_QUERY
                 and key.shape[-2] >= _DECODE_MIN_KEY):

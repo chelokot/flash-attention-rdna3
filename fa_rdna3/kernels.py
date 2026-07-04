@@ -60,13 +60,15 @@ def _attention_inner(
     offs_m, offs_d,
     start_n, end_n, seqlen_k,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
-    MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
+    MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr, PRE_LOAD_V: tl.constexpr,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
     ``q`` is pre-scaled by ``softmax_scale * log2(e)`` so scores land directly in
     the log2 domain and ``exp2`` replaces ``exp``. When ``MASKED`` is false the
     band is fully inside the valid, causal-kept region and no masking is emitted.
+    ``PRE_LOAD_V`` loads V before the QK dot to overlap its latency, at the cost
+    of holding it live across the softmax (more register pressure).
     """
     for start in range(start_n, end_n, BLOCK_N):
         start = tl.multiple_of(start, BLOCK_N)
@@ -76,10 +78,13 @@ def _attention_inner(
         v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
         if MASKED:
             k = tl.load(k_ptrs, mask=offs_n[None, :] < seqlen_k, other=0.0)
-            v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
         else:
             k = tl.load(k_ptrs)
-            v = tl.load(v_ptrs)
+        if PRE_LOAD_V:
+            if MASKED:
+                v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
 
         qk = tl.dot(q, k)
 
@@ -97,6 +102,11 @@ def _attention_inner(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
+        if not PRE_LOAD_V:
+            if MASKED:
+                v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
         acc += tl.dot(p.to(v.dtype), v)
 
         m_i = m_new
@@ -124,6 +134,8 @@ def _attention_forward(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr = True,
 ):
     tl.static_assert((HEAD_DIM & (HEAD_DIM - 1)) == 0, "HEAD_DIM must be a power of two")
 
@@ -131,10 +143,11 @@ def _attention_forward(
     batch_head = tl.program_id(1)
     batch_idx = (batch_head // num_heads).to(tl.int64)
     head_idx = (batch_head % num_heads).to(tl.int64)
+    kv_head_idx = head_idx // GROUP_SIZE  # grouped-query: queries in a group share a K/V head
 
     q_base = q_ptr + batch_idx * stride_qb + head_idx * stride_qh
-    k_base = k_ptr + batch_idx * stride_kb + head_idx * stride_kh
-    v_base = v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+    k_base = k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
+    v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
 
     offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -161,13 +174,13 @@ def _attention_forward(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kn, stride_kd, stride_vn, stride_vd,
         offs_m, offs_d, 0, unmasked_n, seqlen_k,
-        BLOCK_N, HEAD_DIM, False, IS_CAUSAL,
+        BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
     )
     acc, l_i, m_i = _attention_inner(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kn, stride_kd, stride_vn, stride_vd,
         offs_m, offs_d, unmasked_n, max_n, seqlen_k,
-        BLOCK_N, HEAD_DIM, True, IS_CAUSAL,
+        BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
     )
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
@@ -325,26 +338,28 @@ def _attention_bwd_dkdv(
     num_heads, seqlen_q, seqlen_k,
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
+    IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
 ):
-    """One key block per program; accumulate dK, dV by looping over query blocks.
+    """One K/V-head block per program; accumulate dK, dV by looping over query blocks.
 
     Scores are held transposed as [BLOCK_N, BLOCK_M] so no probability tile is
     transposed between matmuls. P is recomputed from Q, K and the stored LSE:
-    ``P = exp2(scale*log2(e) * QK^T - log2(e) * LSE)``.
+    ``P = exp2(scale*log2(e) * QK^T - log2(e) * LSE)``. Under grouped-query
+    attention this K/V head is shared by ``GROUP_SIZE`` query heads, so their
+    contributions are summed here (which keeps dK/dV race-free without atomics).
     """
     block_n_idx = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch_idx = (batch_head // num_heads).to(tl.int64)
-    head_idx = (batch_head % num_heads).to(tl.int64)
+    kv_head_idx = (batch_head % num_heads).to(tl.int64)
 
     qk_scale = softmax_scale * LOG2E
     offs_n = block_n_idx * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
 
-    k_ptrs = (k_ptr + batch_idx * stride_kb + head_idx * stride_kh
+    k_ptrs = (k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
               + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
-    v_ptrs = (v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+    v_ptrs = (v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
               + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
     n_mask = offs_n[:, None] < seqlen_k
     k = tl.load(k_ptrs, mask=n_mask, other=0.0)
@@ -353,12 +368,7 @@ def _attention_bwd_dkdv(
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    q_base = q_ptr + batch_idx * stride_qb + head_idx * stride_qh
-    do_base = dout_ptr + batch_idx * stride_dob + head_idx * stride_doh
-    lse_base = lse_ptr + batch_idx * stride_lb + head_idx * stride_lh
-    delta_base = delta_ptr + batch_idx * stride_deb + head_idx * stride_deh
-
-    # Only queries at or below this key block contribute under a causal mask.
+    # Bands depend only on the key block and shape, not on which query head.
     start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
     # Query blocks strictly above the diagonal need no mask, but only if this key
     # block is fully in bounds; the ragged query tail always needs a boundary
@@ -372,26 +382,33 @@ def _attention_bwd_dkdv(
         diag_end = 0
     unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
 
-    dk, dv = _bwd_dkdv_inner(
-        dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-        stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-        offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
-    dk, dv = _bwd_dkdv_inner(
-        dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-        stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-        offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
-    dk, dv = _bwd_dkdv_inner(
-        dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-        stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-        offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+    for g in range(0, GROUP_SIZE, 1):
+        q_head_idx = kv_head_idx * GROUP_SIZE + g
+        q_base = q_ptr + batch_idx * stride_qb + q_head_idx * stride_qh
+        do_base = dout_ptr + batch_idx * stride_dob + q_head_idx * stride_doh
+        lse_base = lse_ptr + batch_idx * stride_lb + q_head_idx * stride_lh
+        delta_base = delta_ptr + batch_idx * stride_deb + q_head_idx * stride_deh
+
+        dk, dv = _bwd_dkdv_inner(
+            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+            offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+        dk, dv = _bwd_dkdv_inner(
+            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+            offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
+        dk, dv = _bwd_dkdv_inner(
+            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+            offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
 
     dk *= softmax_scale
-    dk_ptrs = (dk_ptr + batch_idx * stride_dkb + head_idx * stride_dkh
+    dk_ptrs = (dk_ptr + batch_idx * stride_dkb + kv_head_idx * stride_dkh
                + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd)
-    dv_ptrs = (dv_ptr + batch_idx * stride_dvb + head_idx * stride_dvh
+    dv_ptrs = (dv_ptr + batch_idx * stride_dvb + kv_head_idx * stride_dvh
                + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd)
     tl.store(dk_ptrs, dk.to(dk_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
     tl.store(dv_ptrs, dv.to(dv_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
@@ -414,13 +431,14 @@ def _attention_bwd_dq(
     num_heads, seqlen_q, seqlen_k,
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
+    IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
 ):
     """One query block per program; accumulate dQ by looping over key blocks."""
     block_m_idx = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch_idx = (batch_head // num_heads).to(tl.int64)
     head_idx = (batch_head % num_heads).to(tl.int64)
+    kv_head_idx = head_idx // GROUP_SIZE
 
     qk_scale = softmax_scale * LOG2E
     offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -440,8 +458,8 @@ def _attention_bwd_dq(
 
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    k_base = k_ptr + batch_idx * stride_kb + head_idx * stride_kh
-    v_base = v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+    k_base = k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
+    v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
 
     if IS_CAUSAL:
         max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
@@ -490,6 +508,7 @@ def _attention_split(
     stride_lps, stride_lpb, stride_lph, stride_lpm,
     num_heads, seqlen_q, seqlen_k, seqlen_k_bucket, num_splits,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """Attention of one query block against one contiguous slice of the keys.
 
@@ -503,6 +522,7 @@ def _attention_split(
     batch_head = tl.program_id(2)
     batch_idx = (batch_head // num_heads).to(tl.int64)
     head_idx = (batch_head % num_heads).to(tl.int64)
+    kv_head_idx = head_idx // GROUP_SIZE
 
     blocks_per_split = tl.cdiv(tl.cdiv(seqlen_k, BLOCK_N), num_splits)
     n_start = split_idx * blocks_per_split * BLOCK_N
@@ -512,8 +532,8 @@ def _attention_split(
     offs_d = tl.arange(0, HEAD_DIM)
 
     q_base = q_ptr + batch_idx * stride_qb + head_idx * stride_qh
-    k_base = k_ptr + batch_idx * stride_kb + head_idx * stride_kh
-    v_base = v_ptr + batch_idx * stride_vb + head_idx * stride_vh
+    k_base = k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
+    v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
 
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
@@ -527,7 +547,7 @@ def _attention_split(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kn, stride_kd, stride_vn, stride_vd,
         offs_m, offs_d, n_start, n_end, seqlen_k,
-        BLOCK_N, HEAD_DIM, True, False,
+        BLOCK_N, HEAD_DIM, True, False, True,
     )
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
