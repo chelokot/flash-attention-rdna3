@@ -121,6 +121,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - fp16 and bf16
 - Causal and full (bidirectional) attention
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
+- Logit soft-capping (`softcap`, e.g. Gemma2)
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)

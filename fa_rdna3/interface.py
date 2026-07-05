@@ -59,7 +59,7 @@ def _check_head_groups(query, key, value):
             f"query heads {q_heads} must be a multiple of key/value heads {kv_heads} (grouped-query attention)")
 
 
-def _forward(query, key, value, causal, softmax_scale, window):
+def _forward(query, key, value, causal, softmax_scale, window, softcap):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     group_size = heads // key.shape[1]
@@ -83,11 +83,13 @@ def _forward(query, key, value, causal, softmax_scale, window):
         GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0],
         WINDOW_RIGHT=window[1],
+        softcap=softcap,
+        HAS_SOFTCAP=softcap > 0.0,
     )
     return out, lse
 
 
-def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window):
+def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     kv_heads = key.shape[1]
@@ -127,6 +129,7 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window):
         kv_heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0,
     )
 
     dq_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
@@ -143,29 +146,32 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window):
         heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0,
     )
     return dquery, dkey, dvalue
 
 
 class _FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, causal, softmax_scale, window):
-        out, lse = _forward(query, key, value, causal, softmax_scale, window)
+    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap):
+        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap)
         ctx.save_for_backward(query, key, value, out, lse)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.window = window
+        ctx.softcap = softcap
         return out
 
     @staticmethod
     def backward(ctx, dout):
         query, key, value, out, lse = ctx.saved_tensors
         dquery, dkey, dvalue = _backward(
-            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window)
-        return dquery, dkey, dvalue, None, None, None
+            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap)
+        return dquery, dkey, dvalue, None, None, None, None
 
 
-def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1)):
+def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
+                    softcap=0.0):
     """Compute scaled dot-product attention with the RDNA3 Triton kernel.
 
     Args:
@@ -177,6 +183,8 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
             ``j`` with ``i - left <= j <= i + right``. ``-1`` on a side means no
             limit (the default ``(-1, -1)`` is full attention). Composes with
             ``causal`` (e.g. Mistral: ``causal=True, window_size=(w - 1, 0)``).
+        softcap: if > 0, cap logits as ``softcap * tanh(logit / softcap)`` before
+            softmax (Gemma2's attention logit soft-capping). ``0`` disables it.
 
     Returns:
         The attention output shaped like ``query``. Differentiable in q, k, v.
@@ -194,7 +202,7 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size))
+    return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size), softcap)
 
 
 def flash_attention_decode(query, key, value, softmax_scale=None):

@@ -75,6 +75,7 @@ def _attention_inner(
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr, PRE_LOAD_V: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
@@ -101,6 +102,11 @@ def _attention_inner(
                 v = tl.load(v_ptrs)
 
         qk = tl.dot(q, k)
+        if HAS_SOFTCAP:
+            # Logit cap softcap*tanh(s/softcap), applied in the log2 domain (q is
+            # pre-scaled by scale*log2(e)): cap = softcap*log2(e), qk = cap*tanh(qk/cap).
+            cap = softcap * LOG2E
+            qk = cap * (2.0 * tl.sigmoid(2.0 * qk / cap) - 1.0)
 
         if MASKED:
             if IS_CAUSAL:
@@ -146,6 +152,7 @@ def _bwd_dkdv_inner(
     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
 ):
     """Fold one query band into dK, dV for a fixed key block.
 
@@ -170,8 +177,12 @@ def _bwd_dkdv_inner(
             lse = tl.load(lse_base + offs_m * stride_lm)
             delta = tl.load(delta_base + offs_m * stride_dem)
 
-        qkT = tl.dot(k, tl.trans(q))
-        pT = tl.exp2(qkT * qk_scale - lse[None, :] * LOG2E)
+        qkT = tl.dot(k, tl.trans(q)) * qk_scale
+        if HAS_SOFTCAP:
+            cap = softcap * LOG2E
+            softcap_t = 2.0 * tl.sigmoid(2.0 * qkT / cap) - 1.0
+            qkT = cap * softcap_t
+        pT = tl.exp2(qkT - lse[None, :] * LOG2E)
         if MASKED:
             keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
             if IS_CAUSAL:
@@ -185,6 +196,8 @@ def _bwd_dkdv_inner(
         dv += tl.dot(pT.to(do.dtype), do)
         dpT = tl.dot(v, tl.trans(do))
         dsT = pT * (dpT - delta[None, :])
+        if HAS_SOFTCAP:
+            dsT = dsT * (1.0 - softcap_t * softcap_t)  # chain through softcap*tanh(s/softcap)
         dk += tl.dot(dsT.to(q.dtype), q)
 
     return dk, dv
@@ -198,6 +211,7 @@ def _bwd_dq_inner(
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
 ):
     """Fold one key band into dQ for a fixed query block."""
     for n in range(start_n, end_n, BLOCK_N):
@@ -213,8 +227,12 @@ def _bwd_dq_inner(
             k = tl.load(k_ptrs)
             v = tl.load(v_ptrs)
 
-        qk = tl.dot(q, tl.trans(k))
-        p = tl.exp2(qk * qk_scale - lse[:, None] * LOG2E)
+        qk = tl.dot(q, tl.trans(k)) * qk_scale
+        if HAS_SOFTCAP:
+            cap = softcap * LOG2E
+            softcap_t = 2.0 * tl.sigmoid(2.0 * qk / cap) - 1.0
+            qk = cap * softcap_t
+        p = tl.exp2(qk - lse[:, None] * LOG2E)
         if MASKED:
             keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
             if IS_CAUSAL:
@@ -227,6 +245,8 @@ def _bwd_dq_inner(
 
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - delta[:, None])
+        if HAS_SOFTCAP:
+            ds = ds * (1.0 - softcap_t * softcap_t)
         dq += tl.dot(ds.to(k.dtype), k)
 
     return dq

@@ -57,6 +57,7 @@ def _attention_bwd_dkdv(
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
 ):
     """One K/V-head block per program; accumulate dK, dV by looping over query blocks.
 
@@ -126,23 +127,27 @@ def _attention_bwd_dkdv(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, win_m_lo, win_m_hi, seqlen_q, seqlen_k, qk_scale,
-                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT)
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
+                softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
         else:
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
-                BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
+                softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
-                BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
+                BLOCK_M, HEAD_DIM, False, IS_CAUSAL,
+                softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
-                BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
+                softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
 
     dk *= softmax_scale
     dk_ptrs = (dk_ptr + batch_idx * stride_dkb + kv_head_idx * stride_dkh
@@ -172,6 +177,7 @@ def _attention_bwd_dq(
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
 ):
     """One query block per program; accumulate dQ by looping over key blocks."""
     block_m_idx = tl.program_id(0)
@@ -216,7 +222,8 @@ def _attention_bwd_dq(
             dq, q, do, lse, delta, k_base, v_base,
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, win_lo, win_hi, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT)
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
     else:
         if IS_CAUSAL:
             max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
@@ -229,12 +236,14 @@ def _attention_bwd_dq(
             dq, q, do, lse, delta, k_base, v_base,
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_N, HEAD_DIM, False, IS_CAUSAL)
+            BLOCK_N, HEAD_DIM, False, IS_CAUSAL,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
         dq = _bwd_dq_inner(
             dq, q, do, lse, delta, k_base, v_base,
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_N, HEAD_DIM, True, IS_CAUSAL)
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP)
 
     dq *= softmax_scale
     dq_ptrs = (dq_ptr + batch_idx * stride_dqb + head_idx * stride_dqh

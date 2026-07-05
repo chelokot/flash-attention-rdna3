@@ -29,6 +29,8 @@ def _attention_forward(
     GROUP_SIZE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1,
     WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0,
+    HAS_SOFTCAP: tl.constexpr = False,
     PRE_LOAD_V: tl.constexpr = True,
 ):
     tl.static_assert((HEAD_DIM & (HEAD_DIM - 1)) == 0, "HEAD_DIM must be a power of two")
@@ -73,6 +75,7 @@ def _attention_forward(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, win_lo, win_hi, seqlen_k,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V, WINDOW_LEFT, WINDOW_RIGHT,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
         )
     else:
         if IS_CAUSAL:
@@ -90,12 +93,14 @@ def _attention_forward(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, 0, unmasked_n, seqlen_k,
             BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
         )
         acc, l_i, m_i = _attention_inner(
             acc, l_i, m_i, q, k_base, v_base,
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, unmasked_n, max_n, seqlen_k,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
         )
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
