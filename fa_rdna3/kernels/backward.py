@@ -56,6 +56,7 @@ def _attention_bwd_dkdv(
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
 ):
     """One K/V-head block per program; accumulate dK, dV by looping over query blocks.
 
@@ -86,18 +87,32 @@ def _attention_bwd_dkdv(
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
     # Bands depend only on the key block and shape, not on which query head.
-    start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
-    # Query blocks strictly above the diagonal need no mask, but only if this key
-    # block is fully in bounds; the ragged query tail always needs a boundary
-    # mask. Everything else falls into the masked bands. Clamp to unmasked_end so
-    # the diagonal band and the ragged-tail band never overlap.
-    n_block_full = (block_n_idx + 1) * BLOCK_N <= seqlen_k
-    unmasked_end = seqlen_q // BLOCK_M * BLOCK_M
-    if IS_CAUSAL:
-        diag_end = ((block_n_idx + 1) * BLOCK_N + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+        # Only query rows whose window covers this key block contribute.
+        n_lo = block_n_idx * BLOCK_N
+        if IS_CAUSAL:
+            win_m_lo = n_lo // BLOCK_M * BLOCK_M
+        elif WINDOW_RIGHT >= 0:
+            win_m_lo = tl.maximum(n_lo - WINDOW_RIGHT, 0) // BLOCK_M * BLOCK_M
+        else:
+            win_m_lo = 0
+        if WINDOW_LEFT >= 0:
+            win_m_hi = tl.minimum(seqlen_q, (block_n_idx + 1) * BLOCK_N + WINDOW_LEFT)
+        else:
+            win_m_hi = seqlen_q
     else:
-        diag_end = 0
-    unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
+        start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
+        # Query blocks strictly above the diagonal need no mask, but only if this
+        # key block is fully in bounds; the ragged query tail always needs a
+        # boundary mask. Clamp to unmasked_end so the diagonal band and the
+        # ragged-tail band never overlap.
+        n_block_full = (block_n_idx + 1) * BLOCK_N <= seqlen_k
+        unmasked_end = seqlen_q // BLOCK_M * BLOCK_M
+        if IS_CAUSAL:
+            diag_end = ((block_n_idx + 1) * BLOCK_N + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+        else:
+            diag_end = 0
+        unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
 
     for g in range(0, GROUP_SIZE, 1):
         q_head_idx = kv_head_idx * GROUP_SIZE + g
@@ -106,21 +121,28 @@ def _attention_bwd_dkdv(
         lse_base = lse_ptr + batch_idx * stride_lb + q_head_idx * stride_lh
         delta_base = delta_ptr + batch_idx * stride_deb + q_head_idx * stride_deh
 
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-            offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-            offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
-            offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+        if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+                offs_n, offs_d, win_m_lo, win_m_hi, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT)
+        else:
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+                offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+                offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
+                offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
 
     dk *= softmax_scale
     dk_ptrs = (dk_ptr + batch_idx * stride_dkb + kv_head_idx * stride_dkh
@@ -149,6 +171,7 @@ def _attention_bwd_dq(
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
 ):
     """One query block per program; accumulate dQ by looping over key blocks."""
     block_m_idx = tl.program_id(0)
@@ -178,23 +201,40 @@ def _attention_bwd_dq(
     k_base = k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
     v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
 
-    if IS_CAUSAL:
-        max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
-        unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+    if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+        if WINDOW_LEFT >= 0:
+            win_lo = tl.maximum(block_m_idx * BLOCK_M - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+        else:
+            win_lo = 0
+        if IS_CAUSAL:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+        elif WINDOW_RIGHT >= 0:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
+        else:
+            win_hi = seqlen_k
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kn, stride_kd, stride_vn, stride_vd,
+            offs_m, offs_d, win_lo, win_hi, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT)
     else:
-        max_n = seqlen_k
-        unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
+        if IS_CAUSAL:
+            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+        else:
+            max_n = seqlen_k
+            unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
 
-    dq = _bwd_dq_inner(
-        dq, q, do, lse, delta, k_base, v_base,
-        stride_kn, stride_kd, stride_vn, stride_vd,
-        offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_N, HEAD_DIM, False, IS_CAUSAL)
-    dq = _bwd_dq_inner(
-        dq, q, do, lse, delta, k_base, v_base,
-        stride_kn, stride_kd, stride_vn, stride_vd,
-        offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_N, HEAD_DIM, True, IS_CAUSAL)
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kn, stride_kd, stride_vn, stride_vd,
+            offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, False, IS_CAUSAL)
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kn, stride_kd, stride_vn, stride_vd,
+            offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL)
 
     dq *= softmax_scale
     dq_ptrs = (dq_ptr + batch_idx * stride_dqb + head_idx * stride_dqh

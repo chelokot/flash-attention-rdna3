@@ -74,6 +74,7 @@ def _attention_inner(
     start_n, end_n, seqlen_k,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr, PRE_LOAD_V: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
@@ -106,9 +107,19 @@ def _attention_inner(
                 keep = (offs_m[:, None] >= offs_n[None, :]) & (offs_n[None, :] < seqlen_k)
             else:
                 keep = offs_n[None, :] < seqlen_k
+            if WINDOW_LEFT >= 0:
+                keep = keep & (offs_n[None, :] >= offs_m[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                keep = keep & (offs_n[None, :] <= offs_m[:, None] + WINDOW_RIGHT)
             qk = tl.where(keep, qk, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        if MASKED:
+            # A tile fully outside a row's kept region leaves m_new at -inf; reset
+            # it so the row contributes nothing instead of exp2(-inf - -inf) = NaN.
+            # The online softmax result is invariant to the running max, so this is
+            # exact. Only reachable with a window/boundary that can empty a tile.
+            m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(qk - m_new[:, None])
 
@@ -134,6 +145,7 @@ def _bwd_dkdv_inner(
     offs_n, offs_d, start_m, end_m, seqlen_q, seqlen_k, qk_scale,
     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
 ):
     """Fold one query band into dK, dV for a fixed key block.
 
@@ -164,6 +176,10 @@ def _bwd_dkdv_inner(
             keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
             if IS_CAUSAL:
                 keep = keep & (offs_m[None, :] >= offs_n[:, None])
+            if WINDOW_LEFT >= 0:
+                keep = keep & (offs_n[:, None] >= offs_m[None, :] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                keep = keep & (offs_n[:, None] <= offs_m[None, :] + WINDOW_RIGHT)
             pT = tl.where(keep, pT, 0.0)
 
         dv += tl.dot(pT.to(do.dtype), do)
@@ -181,6 +197,7 @@ def _bwd_dq_inner(
     offs_m, offs_d, start_n, end_n, seqlen_q, seqlen_k, qk_scale,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
 ):
     """Fold one key band into dQ for a fixed query block."""
     for n in range(start_n, end_n, BLOCK_N):
@@ -202,6 +219,10 @@ def _bwd_dq_inner(
             keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
             if IS_CAUSAL:
                 keep = keep & (offs_m[:, None] >= offs_n[None, :])
+            if WINDOW_LEFT >= 0:
+                keep = keep & (offs_n[None, :] >= offs_m[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                keep = keep & (offs_n[None, :] <= offs_m[:, None] + WINDOW_RIGHT)
             p = tl.where(keep, p, 0.0)
 
         dp = tl.dot(do, tl.trans(v))

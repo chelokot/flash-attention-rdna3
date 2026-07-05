@@ -120,6 +120,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Head dims 16, 32, 64, 128, 256
 - fp16 and bf16
 - Causal and full (bidirectional) attention
+- Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)
@@ -142,13 +143,13 @@ python bench/config_sweep.py       # correctness of every autotune config
 backend on gfx1100 — they run fast enough to win autotuning but return large
 localized errors for some dtypes. The sweep found them (still reproducible on
 Triton 3.5.1 / ROCm 6.4); they are excluded from the kernel's search space
-(`_MISCOMPILED_ON_GFX1100` in `fa_rdna3/kernels.py`) so autotuning can only ever
+(`_MISCOMPILED_ON_GFX1100` in `fa_rdna3/kernels/`) so autotuning can only ever
 select a numerically correct config.
 
 ## How it works
 
 Standard FlashAttention-2 tiling with an online softmax, so the score matrix is
-never materialised. RDNA3-specific choices live in `fa_rdna3/kernels.py`:
+never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
 
 - Autotuned block sizes over a grid sized for RDNA3's 32-lane WMMA fragments and
   the 64 KB per-workgroup LDS limit.
@@ -173,6 +174,14 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels.py`:
 - Decode splits the KV cache across workgroups (each computes a partial output
   and LSE) and merges the partials with an LSE reduction, so a one-row query
   saturates the GPU instead of leaving one workgroup to walk the whole cache.
+
+## Acknowledgements
+
+Built on ideas and conventions from prior FlashAttention work:
+
+- [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) — the FlashAttention-2 algorithm and the `window_size=(left, right)` sliding-window convention.
+- [ROCm/aotriton](https://github.com/ROCm/aotriton) — AMD's ahead-of-time Triton attention kernels; source of the RDNA `PRE_LOAD_V` idea and a benchmarking reference.
+- [OpenAI Triton FlashAttention tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html) — the tiling and online-softmax kernel structure.
 
 ## License
 
