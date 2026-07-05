@@ -123,6 +123,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Logit soft-capping (`softcap`, e.g. Gemma2)
 - Additive attention bias / mask (`bias`, broadcastable; float or `-inf` mask)
+- ALiBi positional bias (`alibi_slopes`, computed in-kernel — no materialised tensor)
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)

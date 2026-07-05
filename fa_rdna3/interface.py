@@ -66,6 +66,28 @@ def _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k):
     return bias, sbb, sbh, sbm, sbn, True
 
 
+def _alibi_args(alibi_slopes, query):
+    """Return (per-head-slopes-or-dummy tensor, has_alibi). A None uses query."""
+    if alibi_slopes is None:
+        return query, False
+    return alibi_slopes.to(torch.float32).contiguous(), True
+
+
+def alibi_slopes(n_heads, device="cuda"):
+    """Standard ALiBi per-head slopes (Press et al., 2021) as a (n_heads,) tensor."""
+    def pow2_slopes(n):
+        start = 2.0 ** (-(2.0 ** -(math.log2(n) - 3)))
+        return [start ** (i + 1) for i in range(n)]
+
+    if math.log2(n_heads).is_integer():
+        slopes = pow2_slopes(n_heads)
+    else:
+        closest = 2 ** math.floor(math.log2(n_heads))
+        slopes = pow2_slopes(closest)
+        slopes += pow2_slopes(2 * closest)[0::2][: n_heads - closest]
+    return torch.tensor(slopes, dtype=torch.float32, device=device)
+
+
 def _check_head_groups(query, key, value):
     q_heads, kv_heads, v_heads = query.shape[1], key.shape[1], value.shape[1]
     if kv_heads != v_heads:
@@ -75,7 +97,7 @@ def _check_head_groups(query, key, value):
             f"query heads {q_heads} must be a multiple of key/value heads {kv_heads} (grouped-query attention)")
 
 
-def _forward(query, key, value, causal, softmax_scale, window, softcap, bias):
+def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     group_size = heads // key.shape[1]
@@ -83,6 +105,7 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias):
     out = torch.empty_like(query)
     lse = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=query.device)
     bias_t, sbb, sbh, sbm, sbn, has_bias = _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k)
+    alibi_t, has_alibi = _alibi_args(alibi, query)
 
     grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
     _attention_forward[grid](
@@ -94,6 +117,7 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias):
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         bias_t, sbb, sbh, sbm, sbn,
+        alibi_t,
         heads, seqlen_q, seqlen_k,
         _autotune_seqlen_key(seqlen_q, query.dtype), _autotune_seqlen_key(seqlen_k, query.dtype),
         HEAD_DIM=head_dim,
@@ -104,17 +128,19 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias):
         softcap=softcap,
         HAS_SOFTCAP=softcap > 0.0,
         HAS_BIAS=has_bias,
+        HAS_ALIBI=has_alibi,
     )
     return out, lse
 
 
-def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap, bias):
+def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap, bias, alibi):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     kv_heads = key.shape[1]
     group_size = heads // kv_heads
     dout = dout.contiguous()
     bias_t, sbb, sbh, sbm, sbn, has_bias = _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k)
+    alibi_t, has_alibi = _alibi_args(alibi, query)
 
     delta = torch.empty_like(lse)
     dquery = torch.empty_like(query)
@@ -147,10 +173,11 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         dkey.stride(0), dkey.stride(1), dkey.stride(2), dkey.stride(3),
         dvalue.stride(0), dvalue.stride(1), dvalue.stride(2), dvalue.stride(3),
         bias_t, sbb, sbh, sbm, sbn,
+        alibi_t,
         kv_heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
-        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias,
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias, HAS_ALIBI=has_alibi,
     )
 
     dq_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
@@ -165,19 +192,20 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         delta.stride(0), delta.stride(1), delta.stride(2),
         dquery.stride(0), dquery.stride(1), dquery.stride(2), dquery.stride(3),
         bias_t, sbb, sbh, sbm, sbn,
+        alibi_t,
         heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
-        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias,
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias, HAS_ALIBI=has_alibi,
     )
     return dquery, dkey, dvalue
 
 
 class _FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias):
-        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias)
-        ctx.save_for_backward(query, key, value, out, lse, bias)
+    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias, alibi):
+        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi)
+        ctx.save_for_backward(query, key, value, out, lse, bias, alibi)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.window = window
@@ -186,14 +214,14 @@ class _FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        query, key, value, out, lse, bias = ctx.saved_tensors
+        query, key, value, out, lse, bias, alibi = ctx.saved_tensors
         dquery, dkey, dvalue = _backward(
-            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias)
-        return dquery, dkey, dvalue, None, None, None, None, None
+            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias, alibi)
+        return dquery, dkey, dvalue, None, None, None, None, None, None
 
 
 def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
-                    softcap=0.0, bias=None):
+                    softcap=0.0, bias=None, alibi_slopes=None):
     """Compute scaled dot-product attention with the RDNA3 Triton kernel.
 
     Args:
@@ -211,6 +239,9 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
             ``(batch, heads, seqlen_q, seqlen_k)`` and added to the scores before
             softmax (use ``-inf`` entries for a hard mask). Treated as a constant
             (not differentiable); gradients still flow to q, k, v.
+        alibi_slopes: optional ``(heads,)`` per-head ALiBi slopes; adds
+            ``slope * (key_pos - query_pos)`` to the logits in-kernel (no
+            materialised bias). Use :func:`alibi_slopes` for the standard values.
 
     Returns:
         The attention output shaped like ``query``. Differentiable in q, k, v.
@@ -229,7 +260,7 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size),
-                                 softcap, bias)
+                                 softcap, bias, alibi_slopes)
 
 
 def flash_attention_decode(query, key, value, softmax_scale=None):

@@ -77,6 +77,7 @@ def _attention_inner(
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
+    alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
@@ -115,6 +116,10 @@ def _attention_inner(
             else:
                 bias = tl.load(bias_ptrs)
             qk += bias.to(tl.float32) * LOG2E  # additive logit bias, into the log2 domain
+        if HAS_ALIBI:
+            # ALiBi: slope * (key_pos - query_pos); query i sits at i + (seqlen_k - seqlen_q).
+            alibi = (offs_n[None, :] - offs_m[:, None] - (seqlen_k - seqlen_q)).to(tl.float32)
+            qk += alibi_slope * alibi * LOG2E
 
         if MASKED:
             if IS_CAUSAL:
@@ -164,6 +169,7 @@ def _bwd_dkdv_inner(
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
+    alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
 ):
     """Fold one query band into dK, dV for a fixed key block.
 
@@ -200,6 +206,9 @@ def _bwd_dkdv_inner(
             else:
                 biasT = tl.load(biasT_ptrs)
             qkT += biasT.to(tl.float32) * LOG2E
+        if HAS_ALIBI:
+            alibiT = (offs_n[:, None] - offs_m[None, :] - (seqlen_k - seqlen_q)).to(tl.float32)
+            qkT += alibi_slope * alibiT * LOG2E
         pT = tl.exp2(qkT - lse[None, :] * LOG2E)
         if MASKED:
             keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
@@ -231,6 +240,7 @@ def _bwd_dq_inner(
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
+    alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
 ):
     """Fold one key band into dQ for a fixed query block."""
     for n in range(start_n, end_n, BLOCK_N):
@@ -258,6 +268,9 @@ def _bwd_dq_inner(
             else:
                 bias = tl.load(bias_ptrs)
             qk += bias.to(tl.float32) * LOG2E
+        if HAS_ALIBI:
+            alibi = (offs_n[None, :] - offs_m[:, None] - (seqlen_k - seqlen_q)).to(tl.float32)
+            qk += alibi_slope * alibi * LOG2E
         p = tl.exp2(qk - lse[:, None] * LOG2E)
         if MASKED:
             keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)

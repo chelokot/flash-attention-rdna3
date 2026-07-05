@@ -53,6 +53,7 @@ def _attention_bwd_dkdv(
     stride_dkb, stride_dkh, stride_dkn, stride_dkd,
     stride_dvb, stride_dvh, stride_dvn, stride_dvd,
     bias_ptr, stride_bb, stride_bh, stride_bm, stride_bn,
+    alibi_ptr,
     num_heads, seqlen_q, seqlen_k,
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -60,6 +61,7 @@ def _attention_bwd_dkdv(
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     HAS_BIAS: tl.constexpr = False,
+    HAS_ALIBI: tl.constexpr = False,
 ):
     """One K/V-head block per program; accumulate dK, dV by looping over query blocks.
 
@@ -125,6 +127,10 @@ def _attention_bwd_dkdv(
         lse_base = lse_ptr + batch_idx * stride_lb + q_head_idx * stride_lh
         delta_base = delta_ptr + batch_idx * stride_deb + q_head_idx * stride_deh
         bias_base = bias_ptr + batch_idx * stride_bb + q_head_idx * stride_bh
+        if HAS_ALIBI:
+            alibi_slope = tl.load(alibi_ptr + q_head_idx)
+        else:
+            alibi_slope = 0.0
 
         if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
             dk, dv = _bwd_dkdv_inner(
@@ -133,7 +139,8 @@ def _attention_bwd_dkdv(
                 offs_n, offs_d, win_m_lo, win_m_hi, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+                alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
         else:
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
@@ -141,21 +148,24 @@ def _attention_bwd_dkdv(
                 offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+                alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, False, IS_CAUSAL,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+                alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
             dk, dv = _bwd_dkdv_inner(
                 dk, dv, k, v, q_base, do_base, lse_base, delta_base,
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+                bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+                alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
 
     dk *= softmax_scale
     dk_ptrs = (dk_ptr + batch_idx * stride_dkb + kv_head_idx * stride_dkh
@@ -181,6 +191,7 @@ def _attention_bwd_dq(
     stride_deb, stride_deh, stride_dem,
     stride_dqb, stride_dqh, stride_dqm, stride_dqd,
     bias_ptr, stride_bb, stride_bh, stride_bm, stride_bn,
+    alibi_ptr,
     num_heads, seqlen_q, seqlen_k,
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -188,6 +199,7 @@ def _attention_bwd_dq(
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     HAS_BIAS: tl.constexpr = False,
+    HAS_ALIBI: tl.constexpr = False,
 ):
     """One query block per program; accumulate dQ by looping over key blocks."""
     block_m_idx = tl.program_id(0)
@@ -218,6 +230,10 @@ def _attention_bwd_dq(
     k_base = k_ptr + batch_idx * stride_kb + kv_head_idx * stride_kh
     v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
     bias_base = bias_ptr + batch_idx * stride_bb + head_idx * stride_bh
+    if HAS_ALIBI:
+        alibi_slope = tl.load(alibi_ptr + head_idx)
+    else:
+        alibi_slope = 0.0
 
     if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
         if WINDOW_LEFT >= 0:
@@ -236,7 +252,8 @@ def _attention_bwd_dq(
             offs_m, offs_d, win_lo, win_hi, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+            alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
     else:
         if IS_CAUSAL:
             max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
@@ -251,14 +268,16 @@ def _attention_bwd_dq(
             offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, False, IS_CAUSAL,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+            alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
         dq = _bwd_dq_inner(
             dq, q, do, lse, delta, k_base, v_base,
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
-            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
+            bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
+            alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
 
     dq *= softmax_scale
     dq_ptrs = (dq_ptr + batch_idx * stride_dqb + head_idx * stride_dqh
