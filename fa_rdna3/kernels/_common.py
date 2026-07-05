@@ -28,10 +28,13 @@ _autotune_bench = functools.partial(do_bench, warmup=40, rep=120)
 
 # (BLOCK_M, BLOCK_N, num_warps) geometries that miscompile in the ROCm Triton
 # WMMA backend on gfx1100: they run fast enough to win autotuning but return
-# large localized errors for some dtypes. Confirmed still broken on Triton 3.5.1
-# / ROCm 6.4 by bench/config_sweep.py; kept out of the search space so
-# autotuning can only pick a numerically correct config.
-_MISCOMPILED_ON_GFX1100 = {(64, 64, 4), (128, 128, 8)}
+# large localized errors (often non-deterministic) for some dtypes. Confirmed on
+# Triton 3.5.1 / ROCm 6.4 by bench/config_sweep.py. (128, 64, 8) tipped over once
+# the kernel grew the optional score-mod arguments (bias/alibi/dropout) — the
+# WMMA codegen for that geometry is fragile enough that extra scalar args change
+# register allocation and break it. Kept out of the search space so autotuning
+# can only pick a numerically correct config.
+_MISCOMPILED_ON_GFX1100 = {(64, 64, 4), (128, 128, 8), (128, 64, 8)}
 
 
 def _fwd_configs():
@@ -78,6 +81,7 @@ def _attention_inner(
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
     alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
+    dropout_p=0.0, dropout_seed=0, dropout_base=0, DROPOUT: tl.constexpr = False,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
@@ -152,6 +156,13 @@ def _attention_inner(
                 v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
             else:
                 v = tl.load(v_ptrs)
+        if DROPOUT:
+            # Drop after l_i (the normalizer keeps the undropped mass); kept
+            # entries are scaled by 1/(1-p). Offset is a global (head, i, j) index
+            # so the backward regenerates the identical mask.
+            offs = (dropout_base + offs_m[:, None]) * seqlen_k + offs_n[None, :]
+            keep_d = tl.rand(dropout_seed, offs) > dropout_p
+            p = tl.where(keep_d, p * (1.0 / (1.0 - dropout_p)), 0.0)
         acc += tl.dot(p.to(v.dtype), v)
 
         m_i = m_new
@@ -170,6 +181,7 @@ def _bwd_dkdv_inner(
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
     alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
+    dropout_p=0.0, dropout_seed=0, dropout_base=0, DROPOUT: tl.constexpr = False,
 ):
     """Fold one query band into dK, dV for a fixed key block.
 
@@ -220,8 +232,17 @@ def _bwd_dkdv_inner(
                 keep = keep & (offs_n[:, None] <= offs_m[None, :] + WINDOW_RIGHT)
             pT = tl.where(keep, pT, 0.0)
 
-        dv += tl.dot(pT.to(do.dtype), do)
+        if DROPOUT:
+            offsT = (dropout_base + offs_m[None, :]) * seqlen_k + offs_n[:, None]
+            keepT = tl.rand(dropout_seed, offsT) > dropout_p
+            inv_keep = 1.0 / (1.0 - dropout_p)
+            pT_d = tl.where(keepT, pT * inv_keep, 0.0)
+        else:
+            pT_d = pT
+        dv += tl.dot(pT_d.to(do.dtype), do)
         dpT = tl.dot(v, tl.trans(do))
+        if DROPOUT:
+            dpT = tl.where(keepT, dpT * inv_keep, 0.0)
         dsT = pT * (dpT - delta[None, :])
         if HAS_SOFTCAP:
             dsT = dsT * (1.0 - softcap_t * softcap_t)  # chain through softcap*tanh(s/softcap)
@@ -241,6 +262,7 @@ def _bwd_dq_inner(
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
     bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
     alibi_slope=0.0, HAS_ALIBI: tl.constexpr = False,
+    dropout_p=0.0, dropout_seed=0, dropout_base=0, DROPOUT: tl.constexpr = False,
 ):
     """Fold one key band into dQ for a fixed query block."""
     for n in range(start_n, end_n, BLOCK_N):
@@ -283,6 +305,10 @@ def _bwd_dq_inner(
             p = tl.where(keep, p, 0.0)
 
         dp = tl.dot(do, tl.trans(v))
+        if DROPOUT:
+            offs = (dropout_base + offs_m[:, None]) * seqlen_k + offs_n[None, :]
+            keep_d = tl.rand(dropout_seed, offs) > dropout_p
+            dp = tl.where(keep_d, dp * (1.0 / (1.0 - dropout_p)), 0.0)
         ds = p * (dp - delta[:, None])
         if HAS_SOFTCAP:
             ds = ds * (1.0 - softcap_t * softcap_t)

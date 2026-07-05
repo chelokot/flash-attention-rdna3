@@ -21,7 +21,7 @@ def _attention_forward(
     stride_ob, stride_oh, stride_om, stride_od,
     stride_lb, stride_lh, stride_lm,
     bias_ptr, stride_bb, stride_bh, stride_bm, stride_bn,
-    alibi_ptr,
+    alibi_ptr, dropout_p, dropout_seed,
     num_heads, seqlen_q, seqlen_k,
     seqlen_q_bucket, seqlen_k_bucket,
     HEAD_DIM: tl.constexpr,
@@ -35,6 +35,7 @@ def _attention_forward(
     HAS_SOFTCAP: tl.constexpr = False,
     HAS_BIAS: tl.constexpr = False,
     HAS_ALIBI: tl.constexpr = False,
+    DROPOUT: tl.constexpr = False,
     PRE_LOAD_V: tl.constexpr = True,
 ):
     tl.static_assert((HEAD_DIM & (HEAD_DIM - 1)) == 0, "HEAD_DIM must be a power of two")
@@ -53,6 +54,10 @@ def _attention_forward(
         alibi_slope = tl.load(alibi_ptr + head_idx)
     else:
         alibi_slope = 0.0
+    if DROPOUT:
+        dropout_base = (batch_idx * num_heads + head_idx) * seqlen_q
+    else:
+        dropout_base = 0
 
     causal_offset = seqlen_k - seqlen_q  # bottom-right causal alignment
     offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -88,6 +93,7 @@ def _attention_forward(
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
+            dropout_p=dropout_p, dropout_seed=dropout_seed, dropout_base=dropout_base, DROPOUT=DROPOUT,
         )
     else:
         if IS_CAUSAL:
@@ -108,6 +114,7 @@ def _attention_forward(
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
+            dropout_p=dropout_p, dropout_seed=dropout_seed, dropout_base=dropout_base, DROPOUT=DROPOUT,
         )
         acc, l_i, m_i = _attention_inner(
             acc, l_i, m_i, q, k_base, v_base,
@@ -117,6 +124,7 @@ def _attention_forward(
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
+            dropout_p=dropout_p, dropout_seed=dropout_seed, dropout_base=dropout_base, DROPOUT=DROPOUT,
         )
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)

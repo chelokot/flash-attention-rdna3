@@ -97,7 +97,7 @@ def _check_head_groups(query, key, value):
             f"query heads {q_heads} must be a multiple of key/value heads {kv_heads} (grouped-query attention)")
 
 
-def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi):
+def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi, dropout_p, dropout_seed):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     group_size = heads // key.shape[1]
@@ -117,7 +117,7 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, al
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         bias_t, sbb, sbh, sbm, sbn,
-        alibi_t,
+        alibi_t, dropout_p, dropout_seed,
         heads, seqlen_q, seqlen_k,
         _autotune_seqlen_key(seqlen_q, query.dtype), _autotune_seqlen_key(seqlen_k, query.dtype),
         HEAD_DIM=head_dim,
@@ -129,11 +129,12 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, al
         HAS_SOFTCAP=softcap > 0.0,
         HAS_BIAS=has_bias,
         HAS_ALIBI=has_alibi,
+        DROPOUT=dropout_p > 0.0,
     )
     return out, lse
 
 
-def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap, bias, alibi):
+def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap, bias, alibi, dropout_p, dropout_seed):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     kv_heads = key.shape[1]
@@ -173,11 +174,12 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         dkey.stride(0), dkey.stride(1), dkey.stride(2), dkey.stride(3),
         dvalue.stride(0), dvalue.stride(1), dvalue.stride(2), dvalue.stride(3),
         bias_t, sbb, sbh, sbm, sbn,
-        alibi_t,
+        alibi_t, dropout_p, dropout_seed,
         kv_heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
         softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias, HAS_ALIBI=has_alibi,
+        DROPOUT=dropout_p > 0.0,
     )
 
     dq_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
@@ -192,36 +194,42 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         delta.stride(0), delta.stride(1), delta.stride(2),
         dquery.stride(0), dquery.stride(1), dquery.stride(2), dquery.stride(3),
         bias_t, sbb, sbh, sbm, sbn,
-        alibi_t,
+        alibi_t, dropout_p, dropout_seed,
         heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
         softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias, HAS_ALIBI=has_alibi,
+        DROPOUT=dropout_p > 0.0,
     )
     return dquery, dkey, dvalue
 
 
 class _FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias, alibi):
-        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi)
+    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias, alibi, dropout_p):
+        dropout_seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if dropout_p > 0.0 else 0
+        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi,
+                            dropout_p, dropout_seed)
         ctx.save_for_backward(query, key, value, out, lse, bias, alibi)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.window = window
         ctx.softcap = softcap
+        ctx.dropout_p = dropout_p
+        ctx.dropout_seed = dropout_seed
         return out
 
     @staticmethod
     def backward(ctx, dout):
         query, key, value, out, lse, bias, alibi = ctx.saved_tensors
         dquery, dkey, dvalue = _backward(
-            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias, alibi)
-        return dquery, dkey, dvalue, None, None, None, None, None, None
+            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias, alibi,
+            ctx.dropout_p, ctx.dropout_seed)
+        return dquery, dkey, dvalue, None, None, None, None, None, None, None
 
 
 def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
-                    softcap=0.0, bias=None, alibi_slopes=None):
+                    softcap=0.0, bias=None, alibi_slopes=None, dropout_p=0.0):
     """Compute scaled dot-product attention with the RDNA3 Triton kernel.
 
     Args:
@@ -242,6 +250,9 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
         alibi_slopes: optional ``(heads,)`` per-head ALiBi slopes; adds
             ``slope * (key_pos - query_pos)`` to the logits in-kernel (no
             materialised bias). Use :func:`alibi_slopes` for the standard values.
+        dropout_p: attention dropout probability applied to the softmax weights
+            (kept entries scaled by ``1/(1-p)``). A fresh RNG seed is drawn per
+            forward and reused in backward so the mask matches. ``0`` disables it.
 
     Returns:
         The attention output shaped like ``query``. Differentiable in q, k, v.
@@ -260,7 +271,7 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size),
-                                 softcap, bias, alibi_slopes)
+                                 softcap, bias, alibi_slopes, dropout_p)
 
 
 def flash_attention_decode(query, key, value, softmax_scale=None):
