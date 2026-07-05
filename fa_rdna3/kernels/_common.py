@@ -118,7 +118,9 @@ def _attention_inner(
 
         if MASKED:
             if IS_CAUSAL:
-                keep = (offs_m[:, None] >= offs_n[None, :]) & (offs_n[None, :] < seqlen_k)
+                # Bottom-right alignment: query i sits at absolute position
+                # i + (seqlen_k - seqlen_q), so it attends keys j <= that.
+                keep = (offs_m[:, None] + (seqlen_k - seqlen_q) >= offs_n[None, :]) & (offs_n[None, :] < seqlen_k)
             else:
                 keep = offs_n[None, :] < seqlen_k
             if WINDOW_LEFT >= 0:
@@ -202,7 +204,7 @@ def _bwd_dkdv_inner(
         if MASKED:
             keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
             if IS_CAUSAL:
-                keep = keep & (offs_m[None, :] >= offs_n[:, None])
+                keep = keep & (offs_m[None, :] + (seqlen_k - seqlen_q) >= offs_n[:, None])
             if WINDOW_LEFT >= 0:
                 keep = keep & (offs_n[:, None] >= offs_m[None, :] - WINDOW_LEFT)
             if WINDOW_RIGHT >= 0:
@@ -260,7 +262,7 @@ def _bwd_dq_inner(
         if MASKED:
             keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
             if IS_CAUSAL:
-                keep = keep & (offs_m[:, None] >= offs_n[None, :])
+                keep = keep & (offs_m[:, None] + (seqlen_k - seqlen_q) >= offs_n[None, :])
             if WINDOW_LEFT >= 0:
                 keep = keep & (offs_n[None, :] >= offs_m[:, None] - WINDOW_LEFT)
             if WINDOW_RIGHT >= 0:

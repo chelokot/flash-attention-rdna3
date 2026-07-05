@@ -48,6 +48,7 @@ def _attention_forward(
     v_base = v_ptr + batch_idx * stride_vb + kv_head_idx * stride_vh
     bias_base = bias_ptr + batch_idx * stride_bb + head_idx * stride_bh
 
+    causal_offset = seqlen_k - seqlen_q  # bottom-right causal alignment
     offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
 
@@ -68,7 +69,7 @@ def _attention_forward(
         else:
             win_lo = 0
         if IS_CAUSAL:
-            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
         elif WINDOW_RIGHT >= 0:
             win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
         else:
@@ -83,10 +84,10 @@ def _attention_forward(
         )
     else:
         if IS_CAUSAL:
-            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
             # Key blocks strictly below the diagonal and inside the key bound need
             # no mask; the diagonal band and any ragged key tail inside it do.
-            unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+            unmasked_n = tl.minimum(tl.maximum(block_m_idx * BLOCK_M + causal_offset, 0), seqlen_k) // BLOCK_N * BLOCK_N
         else:
             max_n = seqlen_k
             # Only the ragged tail past the last whole block needs a boundary mask.

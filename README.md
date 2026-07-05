@@ -119,7 +119,7 @@ enable_rdna3_flash_attention()  # call once at startup
 
 - Head dims 16, 32, 64, 128, 256
 - fp16 and bf16
-- Causal and full (bidirectional) attention
+- Causal (bottom-right aligned for `seqlen_q != seqlen_k`) and full attention
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Logit soft-capping (`softcap`, e.g. Gemma2)
 - Additive attention bias / mask (`bias`, broadcastable; float or `-inf` mask)

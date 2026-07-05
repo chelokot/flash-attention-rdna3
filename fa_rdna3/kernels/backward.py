@@ -75,6 +75,7 @@ def _attention_bwd_dkdv(
     kv_head_idx = (batch_head % num_heads).to(tl.int64)
 
     qk_scale = softmax_scale * LOG2E
+    causal_offset = seqlen_k - seqlen_q  # bottom-right causal alignment
     offs_n = block_n_idx * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
 
@@ -94,7 +95,7 @@ def _attention_bwd_dkdv(
         # Only query rows whose window covers this key block contribute.
         n_lo = block_n_idx * BLOCK_N
         if IS_CAUSAL:
-            win_m_lo = n_lo // BLOCK_M * BLOCK_M
+            win_m_lo = tl.maximum(n_lo - causal_offset, 0) // BLOCK_M * BLOCK_M
         elif WINDOW_RIGHT >= 0:
             win_m_lo = tl.maximum(n_lo - WINDOW_RIGHT, 0) // BLOCK_M * BLOCK_M
         else:
@@ -104,7 +105,7 @@ def _attention_bwd_dkdv(
         else:
             win_m_hi = seqlen_q
     else:
-        start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
+        start_m = tl.maximum(block_n_idx * BLOCK_N - causal_offset, 0) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
         # Query blocks strictly above the diagonal need no mask, but only if this
         # key block is fully in bounds; the ragged query tail always needs a
         # boundary mask. Clamp to unmasked_end so the diagonal band and the
@@ -112,7 +113,7 @@ def _attention_bwd_dkdv(
         n_block_full = (block_n_idx + 1) * BLOCK_N <= seqlen_k
         unmasked_end = seqlen_q // BLOCK_M * BLOCK_M
         if IS_CAUSAL:
-            diag_end = ((block_n_idx + 1) * BLOCK_N + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+            diag_end = (tl.maximum((block_n_idx + 1) * BLOCK_N - causal_offset, 0) + BLOCK_M - 1) // BLOCK_M * BLOCK_M
         else:
             diag_end = 0
         unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
@@ -196,6 +197,7 @@ def _attention_bwd_dq(
     kv_head_idx = head_idx // GROUP_SIZE
 
     qk_scale = softmax_scale * LOG2E
+    causal_offset = seqlen_k - seqlen_q  # bottom-right causal alignment
     offs_m = block_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
     m_mask = offs_m[:, None] < seqlen_q
@@ -223,7 +225,7 @@ def _attention_bwd_dq(
         else:
             win_lo = 0
         if IS_CAUSAL:
-            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
         elif WINDOW_RIGHT >= 0:
             win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
         else:
@@ -237,8 +239,8 @@ def _attention_bwd_dq(
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS)
     else:
         if IS_CAUSAL:
-            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
-            unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
+            unmasked_n = tl.minimum(tl.maximum(block_m_idx * BLOCK_M + causal_offset, 0), seqlen_k) // BLOCK_N * BLOCK_N
         else:
             max_n = seqlen_k
             unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
