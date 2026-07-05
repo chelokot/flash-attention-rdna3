@@ -1,8 +1,8 @@
 # FlashAttention-2 for AMD RDNA3 (gfx1100)
 
-A Triton implementation of FlashAttention-2 — forward, backward, and a split-K
-decode path — tuned for the AMD Radeon RX 7900 XT / XTX / GRE (RDNA3,
-`gfx1100`).
+A Triton implementation of FlashAttention-2 — forward, backward, split-K
+decode, and variable-length (packed) sequences — tuned for the AMD Radeon
+RX 7900 XT / XTX / GRE (RDNA3, `gfx1100`).
 
 RDNA3 has been [the platform without a production-quality fused attention
 kernel](https://llm-tracker.info/howto/AMD-GPUs) for years: the official
@@ -93,6 +93,17 @@ from fa_rdna3 import flash_attention_decode
 out = flash_attention_decode(q_step, k_cache, v_cache)  # q_step is (b, h, 1, d)
 ```
 
+Variable-length packed sequences — concatenate without padding and pass
+cumulative lengths (`(total_tokens, heads, head_dim)` layout):
+
+```python
+from fa_rdna3 import flash_attention_varlen
+
+# cu_seqlens = [0, len0, len0+len1, ...]; differentiable in q, k, v
+out = flash_attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                             max_seqlen_q, max_seqlen_k, causal=True)
+```
+
 Transparent drop-in for ComfyUI / diffusers / transformers — installs an
 override of `torch.nn.functional.scaled_dot_product_attention` and defers to
 the original for anything unsupported (attention masks, fp32, exotic head
@@ -113,6 +124,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)
 - Split-K decode for the small-query / long-KV regime
+- Variable-length packed sequences via `cu_seqlens` (no padding), differentiable
 
 ## Testing / benchmarking
 

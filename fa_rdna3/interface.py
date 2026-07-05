@@ -1,9 +1,11 @@
-"""User-facing FlashAttention entry point for RDNA3.
+"""User-facing FlashAttention entry points for RDNA3.
 
-Accepts ``(batch, heads, seqlen, head_dim)`` tensors matching the layout of
-``torch.nn.functional.scaled_dot_product_attention`` and dispatches to the
-Triton forward/backward kernels through an ``autograd.Function`` so the kernel
-is a drop-in differentiable operation.
+``flash_attention`` takes ``(batch, heads, seqlen, head_dim)`` tensors matching
+``torch.nn.functional.scaled_dot_product_attention`` and is a drop-in
+differentiable op (grouped-query attention supported). ``flash_attention_decode``
+is the split-K path for small-query / long-KV decode. ``flash_attention_varlen``
+handles packed variable-length sequences via ``cu_seqlens``. All dispatch to the
+Triton kernels through ``autograd.Function``\\s.
 """
 
 import math
@@ -18,6 +20,10 @@ from .kernels import (
     _attention_bwd_dq,
     _attention_split,
     _attention_combine,
+    _attention_forward_varlen,
+    _attention_bwd_preprocess_varlen,
+    _attention_bwd_dkdv_varlen,
+    _attention_bwd_dq_varlen,
 )
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256)
@@ -34,6 +40,14 @@ def _decode_num_splits(batch, heads, seqlen_q, seqlen_k):
     wanted = (_DECODE_TARGET_PROGRAMS + base - 1) // base
     key_blocks = triton.cdiv(seqlen_k, 64)
     return max(1, min(32, wanted, key_blocks))
+
+
+def _autotune_seqlen_key(seqlen, dtype):
+    # RDNA3 WMMA miscompiles are dtype-dependent, and the autotuner keys on seqlen
+    # buckets, not dtype. Fold the dtype into the bucket so an fp16-tuned config is
+    # never reused for bf16 (or vice versa): cross-dtype reuse silently selects a
+    # config that miscompiles for the other dtype, producing large localized errors.
+    return triton.next_power_of_2(seqlen) * 2 + (0 if dtype == torch.float16 else 1)
 
 
 def _check_head_groups(query, key, value):
@@ -63,7 +77,7 @@ def _forward(query, key, value, causal, softmax_scale):
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         heads, seqlen_q, seqlen_k,
-        triton.next_power_of_2(seqlen_q), triton.next_power_of_2(seqlen_k),
+        _autotune_seqlen_key(seqlen_q, query.dtype), _autotune_seqlen_key(seqlen_k, query.dtype),
         HEAD_DIM=head_dim,
         IS_CAUSAL=causal,
         GROUP_SIZE=group_size,
@@ -83,8 +97,8 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale):
     dkey = torch.empty_like(key)
     dvalue = torch.empty_like(value)
 
-    q_bucket = triton.next_power_of_2(seqlen_q)
-    k_bucket = triton.next_power_of_2(seqlen_k)
+    q_bucket = _autotune_seqlen_key(seqlen_q, query.dtype)
+    k_bucket = _autotune_seqlen_key(seqlen_k, query.dtype)
 
     pre_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
     _attention_bwd_preprocess[pre_grid](
@@ -210,7 +224,7 @@ def flash_attention_decode(query, key, value, softmax_scale=None):
         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
         o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3), o_partial.stride(4),
         lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2), lse_partial.stride(3),
-        heads, seqlen_q, seqlen_k, triton.next_power_of_2(seqlen_k), num_splits,
+        heads, seqlen_q, seqlen_k, _autotune_seqlen_key(seqlen_k, query.dtype), num_splits,
         HEAD_DIM=head_dim, BLOCK_M=_DECODE_BLOCK_M, GROUP_SIZE=group_size,
     )
 
@@ -224,3 +238,150 @@ def flash_attention_decode(query, key, value, softmax_scale=None):
         HEAD_DIM=head_dim, BLOCK_M=64,
     )
     return out
+
+
+def _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+    total_q, q_heads, head_dim = query.shape
+    kv_heads = key.shape[1]
+    group_size = q_heads // kv_heads
+    batch = cu_seqlens_q.numel() - 1
+
+    out = torch.empty_like(query)
+    lse = torch.empty((q_heads, total_q), dtype=torch.float32, device=query.device)
+
+    grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
+    _attention_forward_varlen[grid](
+        query, key, value, out, lse,
+        cu_seqlens_q, cu_seqlens_k,
+        softmax_scale,
+        query.stride(0), query.stride(1), query.stride(2),
+        key.stride(0), key.stride(1), key.stride(2),
+        value.stride(0), value.stride(1), value.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        lse.stride(0), lse.stride(1),
+        q_heads,
+        _autotune_seqlen_key(max_seqlen_q, query.dtype), _autotune_seqlen_key(max_seqlen_k, query.dtype),
+        HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+    )
+    return out, lse
+
+
+def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k,
+                     max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+    total_q, q_heads, head_dim = query.shape
+    kv_heads = key.shape[1]
+    group_size = q_heads // kv_heads
+    batch = cu_seqlens_q.numel() - 1
+    dout = dout.contiguous()
+
+    delta = torch.empty_like(lse)
+    dquery = torch.empty_like(query)
+    dkey = torch.empty_like(key)
+    dvalue = torch.empty_like(value)
+    q_bucket = _autotune_seqlen_key(max_seqlen_q, query.dtype)
+    k_bucket = _autotune_seqlen_key(max_seqlen_k, query.dtype)
+
+    pre_grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
+    _attention_bwd_preprocess_varlen[pre_grid](
+        out, dout, delta, cu_seqlens_q,
+        out.stride(0), out.stride(1), out.stride(2),
+        dout.stride(0), dout.stride(1), dout.stride(2),
+        delta.stride(0), delta.stride(1),
+        q_heads,
+        HEAD_DIM=head_dim, BLOCK_M=128,
+    )
+
+    dkdv_grid = lambda meta: (triton.cdiv(max_seqlen_k, meta["BLOCK_N"]), batch * kv_heads)
+    _attention_bwd_dkdv_varlen[dkdv_grid](
+        query, key, value, dout, lse, delta, dkey, dvalue,
+        cu_seqlens_q, cu_seqlens_k,
+        softmax_scale,
+        query.stride(0), query.stride(1), query.stride(2),
+        key.stride(0), key.stride(1), key.stride(2),
+        value.stride(0), value.stride(1), value.stride(2),
+        dout.stride(0), dout.stride(1), dout.stride(2),
+        lse.stride(0), lse.stride(1),
+        delta.stride(0), delta.stride(1),
+        dkey.stride(0), dkey.stride(1), dkey.stride(2),
+        dvalue.stride(0), dvalue.stride(1), dvalue.stride(2),
+        kv_heads,
+        q_bucket, k_bucket,
+        HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+    )
+
+    dq_grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
+    _attention_bwd_dq_varlen[dq_grid](
+        query, key, value, dout, lse, delta, dquery,
+        cu_seqlens_q, cu_seqlens_k,
+        softmax_scale,
+        query.stride(0), query.stride(1), query.stride(2),
+        key.stride(0), key.stride(1), key.stride(2),
+        value.stride(0), value.stride(1), value.stride(2),
+        dout.stride(0), dout.stride(1), dout.stride(2),
+        lse.stride(0), lse.stride(1),
+        delta.stride(0), delta.stride(1),
+        dquery.stride(0), dquery.stride(1), dquery.stride(2),
+        q_heads,
+        q_bucket, k_bucket,
+        HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+    )
+    return dquery, dkey, dvalue
+
+
+class _FlashAttentionVarlen(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, value, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+        out, lse = _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
+                                   max_seqlen_q, max_seqlen_k, causal, softmax_scale)
+        ctx.save_for_backward(query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.causal = causal
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        dquery, dkey, dvalue = _backward_varlen(
+            dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k,
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.causal, ctx.softmax_scale)
+        return dquery, dkey, dvalue, None, None, None, None, None, None
+
+
+def flash_attention_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
+                           max_seqlen_q, max_seqlen_k, causal=False, softmax_scale=None):
+    """Attention over variable-length sequences packed without padding.
+
+    Args:
+        query: ``(total_q, q_heads, head_dim)`` — all sequences concatenated.
+        key, value: ``(total_k, kv_heads, head_dim)`` (kv_heads may be fewer for GQA).
+        cu_seqlens_q, cu_seqlens_k: int32 ``(batch + 1,)`` cumulative sequence
+            lengths, so sequence ``i`` is rows ``cu_seqlens[i]:cu_seqlens[i+1]``.
+        max_seqlen_q, max_seqlen_k: longest query / key sequence (grid sizing).
+        causal: causal mask within each sequence.
+        softmax_scale: defaults to ``1/sqrt(head_dim)``.
+
+    Returns:
+        ``(total_q, q_heads, head_dim)``. Differentiable in q, k, v.
+    """
+    head_dim = query.shape[-1]
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim {head_dim} not supported; expected one of {_SUPPORTED_HEAD_DIMS}")
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported dtype {query.dtype}; expected float16 or bfloat16")
+    if query.dim() != 3:
+        raise ValueError(f"varlen expects packed (total, heads, dim) tensors; got {query.dim()}D")
+    if query.shape[1] % key.shape[1] != 0:
+        raise ValueError(
+            f"query heads {query.shape[1]} must be a multiple of key/value heads {key.shape[1]}")
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+    cu_seqlens_k = cu_seqlens_k.to(torch.int32)
+
+    return _FlashAttentionVarlen.apply(query, key, value, cu_seqlens_q, cu_seqlens_k,
+                                       int(max_seqlen_q), int(max_seqlen_k), causal, softmax_scale)
