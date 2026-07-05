@@ -42,6 +42,24 @@ def test_dispatch_routes_decode():
     torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
 
 
+def test_dispatch_routes_attn_mask():
+    # A float attn_mask must route through the kernel as an additive bias.
+    torch.manual_seed(2)
+    query = torch.randn(2, 4, 256, 64, device="cuda", dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    mask = torch.randn(2, 4, 256, 256, device="cuda", dtype=torch.float16)
+
+    reference = F.scaled_dot_product_attention(query, key, value, attn_mask=mask)
+
+    enable_rdna3_flash_attention()
+    try:
+        result = F.scaled_dot_product_attention(query, key, value, attn_mask=mask)
+    finally:
+        disable_rdna3_flash_attention()
+    torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
+
+
 def test_dispatch_falls_back_for_unsupported_head_dim():
     # head_dim 96 is unsupported by the kernel; the dispatcher must defer to the original.
     query = torch.randn(1, 4, 256, 96, device="cuda", dtype=torch.float16)

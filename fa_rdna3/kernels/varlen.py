@@ -66,13 +66,13 @@ def _attention_forward_varlen(
     acc, l_i, m_i = _attention_inner(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, 0, unmasked_n, seqlen_k,
+        offs_m, offs_d, 0, unmasked_n, seqlen_k, seqlen_q,
         BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
     )
     acc, l_i, m_i = _attention_inner(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, unmasked_n, max_n, seqlen_k,
+        offs_m, offs_d, unmasked_n, max_n, seqlen_k, seqlen_q,
         BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
     )
 

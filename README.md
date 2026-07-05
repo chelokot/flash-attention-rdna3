@@ -105,9 +105,9 @@ out = flash_attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
 ```
 
 Transparent drop-in for ComfyUI / diffusers / transformers — installs an
-override of `torch.nn.functional.scaled_dot_product_attention` and defers to
-the original for anything unsupported (attention masks, fp32, exotic head
-dims):
+override of `torch.nn.functional.scaled_dot_product_attention` (float or
+boolean `attn_mask` is routed as an additive bias) and defers to the original
+for anything unsupported (fp32, dropout, exotic head dims):
 
 ```python
 from fa_rdna3.sdpa import enable_rdna3_flash_attention
@@ -122,6 +122,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Causal and full (bidirectional) attention
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Logit soft-capping (`softcap`, e.g. Gemma2)
+- Additive attention bias / mask (`bias`, broadcastable; float or `-inf` mask)
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)

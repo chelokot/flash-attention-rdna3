@@ -57,7 +57,7 @@ def _attention_split(
     acc, l_i, m_i = _attention_inner(
         acc, l_i, m_i, q, k_base, v_base,
         stride_kn, stride_kd, stride_vn, stride_vd,
-        offs_m, offs_d, n_start, n_end, seqlen_k,
+        offs_m, offs_d, n_start, n_end, seqlen_k, seqlen_q,
         BLOCK_N, HEAD_DIM, True, False, True,
     )
 

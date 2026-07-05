@@ -71,11 +71,12 @@ def _attention_inner(
     k_base, v_base,
     stride_kn, stride_kd, stride_vn, stride_vd,
     offs_m, offs_d,
-    start_n, end_n, seqlen_k,
+    start_n, end_n, seqlen_k, seqlen_q,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr, PRE_LOAD_V: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
+    bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
 ):
     """Accumulate one contiguous band of key blocks into the online softmax.
 
@@ -107,6 +108,13 @@ def _attention_inner(
             # pre-scaled by scale*log2(e)): cap = softcap*log2(e), qk = cap*tanh(qk/cap).
             cap = softcap * LOG2E
             qk = cap * (2.0 * tl.sigmoid(2.0 * qk / cap) - 1.0)
+        if HAS_BIAS:
+            bias_ptrs = bias_base + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn
+            if MASKED:
+                bias = tl.load(bias_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k), other=0.0)
+            else:
+                bias = tl.load(bias_ptrs)
+            qk += bias.to(tl.float32) * LOG2E  # additive logit bias, into the log2 domain
 
         if MASKED:
             if IS_CAUSAL:
@@ -153,6 +161,7 @@ def _bwd_dkdv_inner(
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
+    bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
 ):
     """Fold one query band into dK, dV for a fixed key block.
 
@@ -182,6 +191,13 @@ def _bwd_dkdv_inner(
             cap = softcap * LOG2E
             softcap_t = 2.0 * tl.sigmoid(2.0 * qkT / cap) - 1.0
             qkT = cap * softcap_t
+        if HAS_BIAS:
+            biasT_ptrs = bias_base + offs_m[None, :] * stride_bm + offs_n[:, None] * stride_bn
+            if MASKED:
+                biasT = tl.load(biasT_ptrs, mask=(offs_m[None, :] < seqlen_q) & (offs_n[:, None] < seqlen_k), other=0.0)
+            else:
+                biasT = tl.load(biasT_ptrs)
+            qkT += biasT.to(tl.float32) * LOG2E
         pT = tl.exp2(qkT - lse[None, :] * LOG2E)
         if MASKED:
             keep = (offs_n[:, None] < seqlen_k) & (offs_m[None, :] < seqlen_q)
@@ -212,6 +228,7 @@ def _bwd_dq_inner(
     MASKED: tl.constexpr, IS_CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
     softcap=0.0, HAS_SOFTCAP: tl.constexpr = False,
+    bias_base=0, stride_bm=0, stride_bn=0, HAS_BIAS: tl.constexpr = False,
 ):
     """Fold one key band into dQ for a fixed query block."""
     for n in range(start_n, end_n, BLOCK_N):
@@ -232,6 +249,13 @@ def _bwd_dq_inner(
             cap = softcap * LOG2E
             softcap_t = 2.0 * tl.sigmoid(2.0 * qk / cap) - 1.0
             qk = cap * softcap_t
+        if HAS_BIAS:
+            bias_ptrs = bias_base + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn
+            if MASKED:
+                bias = tl.load(bias_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k), other=0.0)
+            else:
+                bias = tl.load(bias_ptrs)
+            qk += bias.to(tl.float32) * LOG2E
         p = tl.exp2(qk - lse[:, None] * LOG2E)
         if MASKED:
             keep = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)

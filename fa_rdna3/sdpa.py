@@ -19,7 +19,7 @@ _DECODE_MAX_QUERY = 8
 _DECODE_MIN_KEY = 1024
 
 
-def _is_supported(query, key, value, attn_mask, dropout_p):
+def _is_supported(query, key, value, dropout_p):
     return (
         query.is_cuda
         and query.dtype in (torch.float16, torch.bfloat16)
@@ -30,19 +30,27 @@ def _is_supported(query, key, value, attn_mask, dropout_p):
         and key.shape[-2] == value.shape[-2]
         and key.shape[-3] == value.shape[-3]
         and query.shape[-3] % key.shape[-3] == 0  # grouped-query: q heads divisible by kv heads
-        and attn_mask is None
         and dropout_p == 0.0
     )
 
 
+def _mask_to_bias(attn_mask):
+    if attn_mask is None:
+        return None
+    if attn_mask.dtype == torch.bool:
+        return torch.zeros_like(attn_mask, dtype=torch.float32).masked_fill(~attn_mask, float("-inf"))
+    return attn_mask
+
+
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
-    if _is_supported(query, key, value, attn_mask, dropout_p):
-        if (not is_causal and not torch.is_grad_enabled()
+    if _is_supported(query, key, value, dropout_p):
+        bias = _mask_to_bias(attn_mask)
+        if (bias is None and not is_causal and not torch.is_grad_enabled()
                 and query.shape[-2] <= _DECODE_MAX_QUERY
                 and key.shape[-2] >= _DECODE_MIN_KEY):
             return flash_attention_decode(query, key, value, softmax_scale=scale)
-        return flash_attention(query, key, value, causal=is_causal, softmax_scale=scale)
+        return flash_attention(query, key, value, causal=is_causal, softmax_scale=scale, bias=bias)
     return _original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                           is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
 

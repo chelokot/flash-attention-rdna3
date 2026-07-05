@@ -50,6 +50,22 @@ def _autotune_seqlen_key(seqlen, dtype):
     return triton.next_power_of_2(seqlen) * 2 + (0 if dtype == torch.float16 else 1)
 
 
+def _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k):
+    """Return (bias_or_dummy_tensor, sbb, sbh, sbm, sbn, has_bias) for a kernel call.
+
+    A None bias uses ``query`` as an unused dummy pointer with zero strides. A
+    present bias is broadcast to (batch, heads, seqlen_q, seqlen_k); broadcast
+    dimensions carry stride 0 so the kernel reads the shared value.
+    """
+    if bias is None:
+        return query, 0, 0, 0, 0, False
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+    bias = bias.expand(batch, heads, seqlen_q, seqlen_k)
+    sbb, sbh, sbm, sbn = bias.stride()
+    return bias, sbb, sbh, sbm, sbn, True
+
+
 def _check_head_groups(query, key, value):
     q_heads, kv_heads, v_heads = query.shape[1], key.shape[1], value.shape[1]
     if kv_heads != v_heads:
@@ -59,13 +75,14 @@ def _check_head_groups(query, key, value):
             f"query heads {q_heads} must be a multiple of key/value heads {kv_heads} (grouped-query attention)")
 
 
-def _forward(query, key, value, causal, softmax_scale, window, softcap):
+def _forward(query, key, value, causal, softmax_scale, window, softcap, bias):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     group_size = heads // key.shape[1]
 
     out = torch.empty_like(query)
     lse = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=query.device)
+    bias_t, sbb, sbh, sbm, sbn, has_bias = _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k)
 
     grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
     _attention_forward[grid](
@@ -76,6 +93,7 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap):
         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
+        bias_t, sbb, sbh, sbm, sbn,
         heads, seqlen_q, seqlen_k,
         _autotune_seqlen_key(seqlen_q, query.dtype), _autotune_seqlen_key(seqlen_k, query.dtype),
         HEAD_DIM=head_dim,
@@ -85,16 +103,18 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap):
         WINDOW_RIGHT=window[1],
         softcap=softcap,
         HAS_SOFTCAP=softcap > 0.0,
+        HAS_BIAS=has_bias,
     )
     return out, lse
 
 
-def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap):
+def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, softcap, bias):
     batch, heads, seqlen_q, head_dim = query.shape
     seqlen_k = key.shape[2]
     kv_heads = key.shape[1]
     group_size = heads // kv_heads
     dout = dout.contiguous()
+    bias_t, sbb, sbh, sbm, sbn, has_bias = _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k)
 
     delta = torch.empty_like(lse)
     dquery = torch.empty_like(query)
@@ -126,10 +146,11 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         delta.stride(0), delta.stride(1), delta.stride(2),
         dkey.stride(0), dkey.stride(1), dkey.stride(2), dkey.stride(3),
         dvalue.stride(0), dvalue.stride(1), dvalue.stride(2), dvalue.stride(3),
+        bias_t, sbb, sbh, sbm, sbn,
         kv_heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
-        softcap=softcap, HAS_SOFTCAP=softcap > 0.0,
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias,
     )
 
     dq_grid = lambda meta: (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * heads)
@@ -143,19 +164,20 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
         lse.stride(0), lse.stride(1), lse.stride(2),
         delta.stride(0), delta.stride(1), delta.stride(2),
         dquery.stride(0), dquery.stride(1), dquery.stride(2), dquery.stride(3),
+        bias_t, sbb, sbh, sbm, sbn,
         heads, seqlen_q, seqlen_k, q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
         WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
-        softcap=softcap, HAS_SOFTCAP=softcap > 0.0,
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_BIAS=has_bias,
     )
     return dquery, dkey, dvalue
 
 
 class _FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap):
-        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap)
-        ctx.save_for_backward(query, key, value, out, lse)
+    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias):
+        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias)
+        ctx.save_for_backward(query, key, value, out, lse, bias)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.window = window
@@ -164,14 +186,14 @@ class _FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        query, key, value, out, lse = ctx.saved_tensors
+        query, key, value, out, lse, bias = ctx.saved_tensors
         dquery, dkey, dvalue = _backward(
-            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap)
-        return dquery, dkey, dvalue, None, None, None, None
+            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias)
+        return dquery, dkey, dvalue, None, None, None, None, None
 
 
 def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
-                    softcap=0.0):
+                    softcap=0.0, bias=None):
     """Compute scaled dot-product attention with the RDNA3 Triton kernel.
 
     Args:
@@ -185,6 +207,10 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
             ``causal`` (e.g. Mistral: ``causal=True, window_size=(w - 1, 0)``).
         softcap: if > 0, cap logits as ``softcap * tanh(logit / softcap)`` before
             softmax (Gemma2's attention logit soft-capping). ``0`` disables it.
+        bias: optional additive logit bias / mask, broadcastable to
+            ``(batch, heads, seqlen_q, seqlen_k)`` and added to the scores before
+            softmax (use ``-inf`` entries for a hard mask). Treated as a constant
+            (not differentiable); gradients still flow to q, k, v.
 
     Returns:
         The attention output shaped like ``query``. Differentiable in q, k, v.
@@ -202,7 +228,8 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size), softcap)
+    return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size),
+                                 softcap, bias)
 
 
 def flash_attention_decode(query, key, value, softmax_scale=None):
