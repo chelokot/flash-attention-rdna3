@@ -130,6 +130,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)
 - Split-K decode for the small-query / long-KV regime
+- Paged-KV decode over a block-table cache (`flash_attention_decode_paged`, vLLM-style)
 - Variable-length packed sequences via `cu_seqlens` (no padding), differentiable
 
 ## Testing / benchmarking

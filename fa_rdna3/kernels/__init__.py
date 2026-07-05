@@ -8,6 +8,7 @@ from .backward import (
     _attention_bwd_dq,
 )
 from .decode import _attention_split, _attention_combine
+from .paged import _attention_decode_paged
 from .varlen import (
     _attention_forward_varlen,
     _attention_bwd_preprocess_varlen,

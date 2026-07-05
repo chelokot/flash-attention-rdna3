@@ -24,6 +24,7 @@ from .kernels import (
     _attention_bwd_preprocess_varlen,
     _attention_bwd_dkdv_varlen,
     _attention_bwd_dq_varlen,
+    _attention_decode_paged,
 )
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256)
@@ -505,3 +506,48 @@ def flash_attention_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
 
     return _FlashAttentionVarlen.apply(query, key, value, cu_seqlens_q, cu_seqlens_k,
                                        int(max_seqlen_q), int(max_seqlen_k), causal, softmax_scale)
+
+
+def flash_attention_decode_paged(query, k_cache, v_cache, block_table, context_lens,
+                                 softmax_scale=None):
+    """Decode attention over a paged (block-table) KV cache — vLLM style.
+
+    Args:
+        query: ``(batch, q_heads, head_dim)`` — one query row per sequence.
+        k_cache, v_cache: ``(num_blocks, block_size, kv_heads, head_dim)`` physical
+            block pool (kv_heads may be fewer than q_heads for GQA).
+        block_table: int32 ``(batch, max_blocks_per_seq)`` — physical block id for
+            each logical block of a sequence.
+        context_lens: int32 ``(batch,)`` — number of valid keys per sequence.
+        softmax_scale: defaults to ``1/sqrt(head_dim)``.
+
+    Returns:
+        ``(batch, q_heads, head_dim)``. Non-causal, inference-only.
+    """
+    batch, q_heads, head_dim = query.shape
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim {head_dim} not supported; expected one of {_SUPPORTED_HEAD_DIMS}")
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported dtype {query.dtype}; expected float16 or bfloat16")
+    block_size, kv_heads = k_cache.shape[1], k_cache.shape[2]
+    if q_heads % kv_heads != 0:
+        raise ValueError(f"query heads {q_heads} must be a multiple of kv heads {kv_heads}")
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    block_table = block_table.to(torch.int32)
+    context_lens = context_lens.to(torch.int32)
+
+    out = torch.empty_like(query)
+    grid = (batch * q_heads,)
+    _attention_decode_paged[grid](
+        query, k_cache, v_cache, out, block_table, context_lens,
+        softmax_scale,
+        query.stride(0), query.stride(1), query.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        out.stride(0), out.stride(1), out.stride(2),
+        block_table.stride(0), block_table.stride(1),
+        q_heads,
+        HEAD_DIM=head_dim, BLOCK_SIZE=block_size, GROUP_SIZE=q_heads // kv_heads,
+    )
+    return out
