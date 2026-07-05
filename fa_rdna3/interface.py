@@ -204,28 +204,60 @@ def _backward(dout, query, key, value, out, lse, causal, softmax_scale, window, 
     return dquery, dkey, dvalue
 
 
-class _FlashAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, query, key, value, causal, softmax_scale, window, softcap, bias, alibi, dropout_p):
-        dropout_seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if dropout_p > 0.0 else 0
-        out, lse = _forward(query, key, value, causal, softmax_scale, window, softcap, bias, alibi,
-                            dropout_p, dropout_seed)
-        ctx.save_for_backward(query, key, value, out, lse, bias, alibi)
-        ctx.causal = causal
-        ctx.softmax_scale = softmax_scale
-        ctx.window = window
-        ctx.softcap = softcap
-        ctx.dropout_p = dropout_p
-        ctx.dropout_seed = dropout_seed
-        return out
+# Registered as a torch.library custom op (not a bare autograd.Function) so it is
+# opaque to torch.compile with a fake/meta rule, passes torch.library.opcheck, and
+# stays functional — the dropout seed is an explicit input, not internal state.
+@torch.library.custom_op("fa_rdna3::flash_fwd", mutates_args=())
+def _flash_fwd(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+               causal: bool, softmax_scale: float, window_left: int, window_right: int,
+               softcap: float, bias: "torch.Tensor | None", alibi: "torch.Tensor | None",
+               dropout_p: float, dropout_seed: int) -> "tuple[torch.Tensor, torch.Tensor]":
+    return _forward(query, key, value, causal, softmax_scale, (window_left, window_right),
+                    softcap, bias, alibi, dropout_p, dropout_seed)
 
-    @staticmethod
-    def backward(ctx, dout):
-        query, key, value, out, lse, bias, alibi = ctx.saved_tensors
-        dquery, dkey, dvalue = _backward(
-            dout, query, key, value, out, lse, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, bias, alibi,
-            ctx.dropout_p, ctx.dropout_seed)
-        return dquery, dkey, dvalue, None, None, None, None, None, None, None
+
+@_flash_fwd.register_fake
+def _(query, key, value, causal, softmax_scale, window_left, window_right,
+      softcap, bias, alibi, dropout_p, dropout_seed):
+    out = torch.empty_like(query)
+    lse = query.new_empty((query.shape[0], query.shape[1], query.shape[2]), dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("fa_rdna3::flash_bwd", mutates_args=())
+def _flash_bwd(dout: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+               out: torch.Tensor, lse: torch.Tensor, causal: bool, softmax_scale: float,
+               window_left: int, window_right: int, softcap: float,
+               bias: "torch.Tensor | None", alibi: "torch.Tensor | None",
+               dropout_p: float, dropout_seed: int) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    return _backward(dout, query, key, value, out, lse, causal, softmax_scale,
+                     (window_left, window_right), softcap, bias, alibi, dropout_p, dropout_seed)
+
+
+@_flash_bwd.register_fake
+def _(dout, query, key, value, out, lse, causal, softmax_scale, window_left, window_right,
+      softcap, bias, alibi, dropout_p, dropout_seed):
+    return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+
+def _flash_fwd_setup_context(ctx, inputs, output):
+    (query, key, value, causal, softmax_scale, window_left, window_right,
+     softcap, bias, alibi, dropout_p, dropout_seed) = inputs
+    out, lse = output
+    ctx.save_for_backward(query, key, value, out, lse, bias, alibi)
+    ctx.args = (causal, softmax_scale, window_left, window_right, softcap, dropout_p, dropout_seed)
+
+
+def _flash_fwd_backward(ctx, grad_out, grad_lse):
+    query, key, value, out, lse, bias, alibi = ctx.saved_tensors
+    causal, softmax_scale, window_left, window_right, softcap, dropout_p, dropout_seed = ctx.args
+    dquery, dkey, dvalue = _flash_bwd(
+        grad_out.contiguous(), query, key, value, out, lse, causal, softmax_scale,
+        window_left, window_right, softcap, bias, alibi, dropout_p, dropout_seed)
+    return dquery, dkey, dvalue, None, None, None, None, None, None, None, None, None
+
+
+_flash_fwd.register_autograd(_flash_fwd_backward, setup_context=_flash_fwd_setup_context)
 
 
 def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
@@ -270,8 +302,10 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    return _FlashAttention.apply(query, key, value, causal, softmax_scale, tuple(window_size),
-                                 softcap, bias, alibi_slopes, dropout_p)
+    dropout_seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if dropout_p > 0.0 else 0
+    out, _ = _flash_fwd(query, key, value, causal, softmax_scale, window_size[0], window_size[1],
+                        softcap, bias, alibi_slopes, dropout_p, dropout_seed)
+    return out
 
 
 def flash_attention_decode(query, key, value, softmax_scale=None):

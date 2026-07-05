@@ -125,6 +125,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Additive attention bias / mask (`bias`, broadcastable; float or `-inf` mask)
 - ALiBi positional bias (`alibi_slopes`, computed in-kernel — no materialised tensor)
 - Attention dropout (`dropout_p`, philox mask shared between forward and backward)
+- Registered as a `torch.library` custom op — `torch.compile`-compatible and `opcheck`-clean
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
 - Forward **and backward** (autograd `Function`; deterministic gradients)
