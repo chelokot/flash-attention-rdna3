@@ -22,9 +22,9 @@ _DECODE_MIN_KEY = 1024
 def _is_supported(query, key, value, dropout_p):
     return (
         query.is_cuda
-        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and query.dim() == 4
-        and query.shape[-1] in _SUPPORTED_HEAD_DIMS
+        and query.shape[-1] <= 256  # non-power-of-two dims are padded internally
         and key.shape[-1] == query.shape[-1]
         and value.shape[-1] == query.shape[-1]
         and key.shape[-2] == value.shape[-2]
@@ -47,6 +47,8 @@ def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
     if _is_supported(query, key, value, dropout_p):
         bias = _mask_to_bias(attn_mask)
         if (bias is None and not is_causal and not torch.is_grad_enabled()
+                and query.dtype in (torch.float16, torch.bfloat16)
+                and query.shape[-1] in _SUPPORTED_HEAD_DIMS
                 and query.shape[-2] <= _DECODE_MAX_QUERY
                 and key.shape[-2] >= _DECODE_MIN_KEY):
             return flash_attention_decode(query, key, value, softmax_scale=scale)

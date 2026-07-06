@@ -43,12 +43,16 @@ def _decode_num_splits(batch, heads, seqlen_q, seqlen_k):
     return max(1, min(32, wanted, key_blocks))
 
 
+_DTYPE_KEY = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
 def _autotune_seqlen_key(seqlen, dtype):
     # RDNA3 WMMA miscompiles are dtype-dependent, and the autotuner keys on seqlen
-    # buckets, not dtype. Fold the dtype into the bucket so an fp16-tuned config is
-    # never reused for bf16 (or vice versa): cross-dtype reuse silently selects a
-    # config that miscompiles for the other dtype, producing large localized errors.
-    return triton.next_power_of_2(seqlen) * 2 + (0 if dtype == torch.float16 else 1)
+    # buckets, not dtype. Fold the dtype into the bucket so a config tuned for one
+    # dtype is never reused for another: cross-dtype reuse silently selects a config
+    # that miscompiles for the other dtype, producing large localized errors.
+    return triton.next_power_of_2(seqlen) * 4 + _DTYPE_KEY[dtype]
 
 
 def _bias_args(bias, query, batch, heads, seqlen_q, seqlen_k):
@@ -291,10 +295,8 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
         The attention output shaped like ``query``. Differentiable in q, k, v.
     """
     head_dim = query.shape[-1]
-    if head_dim not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(f"head_dim {head_dim} not supported; expected one of {_SUPPORTED_HEAD_DIMS}")
-    if query.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"unsupported dtype {query.dtype}; expected float16 or bfloat16")
+    if query.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"unsupported dtype {query.dtype}; expected float16, bfloat16 or float32")
     for name, tensor in (("key", key), ("value", value)):
         if tensor.dtype != query.dtype:
             raise ValueError(f"{name} dtype {tensor.dtype} does not match query dtype {query.dtype}")
@@ -303,9 +305,24 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
+    # Non-power-of-two head_dim: pad q/k/v to the next supported size with zeros
+    # (which contribute nothing to q.k^T or p.v) and slice the output back. The
+    # pad/slice are autograd-tracked around the op, so gradients need no change.
+    pad = 0
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        padded = max(16, triton.next_power_of_2(head_dim))
+        if padded not in _SUPPORTED_HEAD_DIMS:
+            raise ValueError(f"head_dim {head_dim} not supported (would pad to {padded})")
+        pad = padded - head_dim
+        query = torch.nn.functional.pad(query, (0, pad))
+        key = torch.nn.functional.pad(key, (0, pad))
+        value = torch.nn.functional.pad(value, (0, pad))
+
     dropout_seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if dropout_p > 0.0 else 0
     out, _ = _flash_fwd(query, key, value, causal, softmax_scale, window_size[0], window_size[1],
                         softcap, bias, alibi_slopes, dropout_p, dropout_seed)
+    if pad:
+        out = out[..., :head_dim]
     return out
 
 
