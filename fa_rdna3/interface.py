@@ -379,7 +379,7 @@ def flash_attention_decode(query, key, value, softmax_scale=None):
 
 
 def _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
-                    max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+                    max_seqlen_q, max_seqlen_k, causal, softmax_scale, window, softcap, alibi):
     total_q, q_heads, head_dim = query.shape
     kv_heads = key.shape[1]
     group_size = q_heads // kv_heads
@@ -387,6 +387,7 @@ def _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
 
     out = torch.empty_like(query)
     lse = torch.empty((q_heads, total_q), dtype=torch.float32, device=query.device)
+    alibi_t, has_alibi = _alibi_args(alibi, query)
 
     grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
     _attention_forward_varlen[grid](
@@ -398,15 +399,18 @@ def _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
         value.stride(0), value.stride(1), value.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         lse.stride(0), lse.stride(1),
+        alibi_t,
         q_heads,
         _autotune_seqlen_key(max_seqlen_q, query.dtype), _autotune_seqlen_key(max_seqlen_k, query.dtype),
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+        WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_ALIBI=has_alibi,
     )
     return out, lse
 
 
 def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k,
-                     max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+                     max_seqlen_q, max_seqlen_k, causal, softmax_scale, window, softcap, alibi):
     total_q, q_heads, head_dim = query.shape
     kv_heads = key.shape[1]
     group_size = q_heads // kv_heads
@@ -419,6 +423,7 @@ def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens
     dvalue = torch.empty_like(value)
     q_bucket = _autotune_seqlen_key(max_seqlen_q, query.dtype)
     k_bucket = _autotune_seqlen_key(max_seqlen_k, query.dtype)
+    alibi_t, has_alibi = _alibi_args(alibi, query)
 
     pre_grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
     _attention_bwd_preprocess_varlen[pre_grid](
@@ -443,9 +448,12 @@ def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens
         delta.stride(0), delta.stride(1),
         dkey.stride(0), dkey.stride(1), dkey.stride(2),
         dvalue.stride(0), dvalue.stride(1), dvalue.stride(2),
+        alibi_t,
         kv_heads,
         q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+        WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_ALIBI=has_alibi,
     )
 
     dq_grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["BLOCK_M"]), batch * q_heads)
@@ -460,9 +468,12 @@ def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens
         lse.stride(0), lse.stride(1),
         delta.stride(0), delta.stride(1),
         dquery.stride(0), dquery.stride(1), dquery.stride(2),
+        alibi_t,
         q_heads,
         q_bucket, k_bucket,
         HEAD_DIM=head_dim, IS_CAUSAL=causal, GROUP_SIZE=group_size,
+        WINDOW_LEFT=window[0], WINDOW_RIGHT=window[1],
+        softcap=softcap, HAS_SOFTCAP=softcap > 0.0, HAS_ALIBI=has_alibi,
     )
     return dquery, dkey, dvalue
 
@@ -470,27 +481,30 @@ def _backward_varlen(dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens
 class _FlashAttentionVarlen(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+                max_seqlen_q, max_seqlen_k, causal, softmax_scale, window, softcap, alibi):
         out, lse = _forward_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
-                                   max_seqlen_q, max_seqlen_k, causal, softmax_scale)
-        ctx.save_for_backward(query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k)
+                                   max_seqlen_q, max_seqlen_k, causal, softmax_scale, window, softcap, alibi)
+        ctx.save_for_backward(query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k, alibi)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
+        ctx.window = window
+        ctx.softcap = softcap
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k, alibi = ctx.saved_tensors
         dquery, dkey, dvalue = _backward_varlen(
             dout, query, key, value, out, lse, cu_seqlens_q, cu_seqlens_k,
-            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.causal, ctx.softmax_scale)
-        return dquery, dkey, dvalue, None, None, None, None, None, None
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.causal, ctx.softmax_scale, ctx.window, ctx.softcap, alibi)
+        return dquery, dkey, dvalue, None, None, None, None, None, None, None, None, None
 
 
 def flash_attention_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
-                           max_seqlen_q, max_seqlen_k, causal=False, softmax_scale=None):
+                           max_seqlen_q, max_seqlen_k, causal=False, softmax_scale=None,
+                           window_size=(-1, -1), softcap=0.0, alibi_slopes=None):
     """Attention over variable-length sequences packed without padding.
 
     Args:
@@ -501,6 +515,8 @@ def flash_attention_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k: longest query / key sequence (grid sizing).
         causal: causal mask within each sequence.
         softmax_scale: defaults to ``1/sqrt(head_dim)``.
+        window_size, softcap, alibi_slopes: same as :func:`flash_attention`, applied
+            per sequence. (Additive ``bias`` and ``dropout`` are batched-only for now.)
 
     Returns:
         ``(total_q, q_heads, head_dim)``. Differentiable in q, k, v.
@@ -522,7 +538,8 @@ def flash_attention_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k,
     cu_seqlens_k = cu_seqlens_k.to(torch.int32)
 
     return _FlashAttentionVarlen.apply(query, key, value, cu_seqlens_q, cu_seqlens_k,
-                                       int(max_seqlen_q), int(max_seqlen_k), causal, softmax_scale)
+                                       int(max_seqlen_q), int(max_seqlen_k), causal, softmax_scale,
+                                       tuple(window_size), softcap, alibi_slopes)
 
 
 def flash_attention_decode_paged(query, k_cache, v_cache, block_table, context_lens,

@@ -21,10 +21,14 @@ def _attention_forward_varlen(
     stride_vt, stride_vh, stride_vd,
     stride_ot, stride_oh, stride_od,
     stride_lh, stride_lt,
+    alibi_ptr,
     num_heads,
     max_seqlen_q_bucket, max_seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr, PRE_LOAD_V: tl.constexpr = True,
+    IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False, HAS_ALIBI: tl.constexpr = False,
+    PRE_LOAD_V: tl.constexpr = True,
 ):
     tl.static_assert((HEAD_DIM & (HEAD_DIM - 1)) == 0, "HEAD_DIM must be a power of two")
 
@@ -51,30 +55,52 @@ def _attention_forward_varlen(
     q_ptrs = q_base + offs_m[:, None] * stride_qt + offs_d[None, :] * stride_qd
     q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
     q = (q * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
+    if HAS_ALIBI:
+        alibi_slope = tl.load(alibi_ptr + head_idx)
+    else:
+        alibi_slope = 0.0
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    if IS_CAUSAL:
-        max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
-        unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+    if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+        if WINDOW_LEFT >= 0:
+            win_lo = tl.maximum(block_m_idx * BLOCK_M - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+        else:
+            win_lo = 0
+        if IS_CAUSAL:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+        elif WINDOW_RIGHT >= 0:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
+        else:
+            win_hi = seqlen_k
+        acc, l_i, m_i = _attention_inner(
+            acc, l_i, m_i, q, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, win_lo, win_hi, seqlen_k, seqlen_q,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V, WINDOW_LEFT, WINDOW_RIGHT,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
     else:
-        max_n = seqlen_k
-        unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
+        if IS_CAUSAL:
+            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+        else:
+            max_n = seqlen_k
+            unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
 
-    acc, l_i, m_i = _attention_inner(
-        acc, l_i, m_i, q, k_base, v_base,
-        stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, 0, unmasked_n, seqlen_k, seqlen_q,
-        BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
-    )
-    acc, l_i, m_i = _attention_inner(
-        acc, l_i, m_i, q, k_base, v_base,
-        stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, unmasked_n, max_n, seqlen_k, seqlen_q,
-        BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
-    )
+        acc, l_i, m_i = _attention_inner(
+            acc, l_i, m_i, q, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, 0, unmasked_n, seqlen_k, seqlen_q,
+            BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+        acc, l_i, m_i = _attention_inner(
+            acc, l_i, m_i, q, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, unmasked_n, max_n, seqlen_k, seqlen_q,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
@@ -139,10 +165,13 @@ def _attention_bwd_dkdv_varlen(
     stride_deh, stride_det,
     stride_dkt, stride_dkh, stride_dkd,
     stride_dvt, stride_dvh, stride_dvd,
+    alibi_ptr,
     num_heads,
     max_seqlen_q_bucket, max_seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False, HAS_ALIBI: tl.constexpr = False,
 ):
     block_n_idx = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -171,14 +200,27 @@ def _attention_bwd_dkdv_varlen(
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
-    n_block_full = (block_n_idx + 1) * BLOCK_N <= seqlen_k
-    unmasked_end = seqlen_q // BLOCK_M * BLOCK_M
-    if IS_CAUSAL:
-        diag_end = ((block_n_idx + 1) * BLOCK_N + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+        n_lo = block_n_idx * BLOCK_N
+        if IS_CAUSAL:
+            win_m_lo = n_lo // BLOCK_M * BLOCK_M
+        elif WINDOW_RIGHT >= 0:
+            win_m_lo = tl.maximum(n_lo - WINDOW_RIGHT, 0) // BLOCK_M * BLOCK_M
+        else:
+            win_m_lo = 0
+        if WINDOW_LEFT >= 0:
+            win_m_hi = tl.minimum(seqlen_q, (block_n_idx + 1) * BLOCK_N + WINDOW_LEFT)
+        else:
+            win_m_hi = seqlen_q
     else:
-        diag_end = 0
-    unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
+        start_m = (block_n_idx * BLOCK_N) // BLOCK_M * BLOCK_M if IS_CAUSAL else 0
+        n_block_full = (block_n_idx + 1) * BLOCK_N <= seqlen_k
+        unmasked_end = seqlen_q // BLOCK_M * BLOCK_M
+        if IS_CAUSAL:
+            diag_end = ((block_n_idx + 1) * BLOCK_N + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+        else:
+            diag_end = 0
+        unmasked_start = tl.where(n_block_full, tl.minimum(diag_end, unmasked_end), unmasked_end)
 
     q_seq = q_ptr + q_start.to(tl.int64) * stride_qt
     do_seq = dout_ptr + q_start.to(tl.int64) * stride_dot
@@ -191,22 +233,32 @@ def _attention_bwd_dkdv_varlen(
         do_base = do_seq + q_head_idx * stride_doh
         lse_base = lse_seq + q_head_idx * stride_lh
         delta_base = delta_seq + q_head_idx * stride_deh
-
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
-            offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
-            offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, False, IS_CAUSAL)
-        dk, dv = _bwd_dkdv_inner(
-            dk, dv, k, v, q_base, do_base, lse_base, delta_base,
-            stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
-            offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
-            BLOCK_M, HEAD_DIM, True, IS_CAUSAL)
+        if HAS_ALIBI:
+            alibi_slope = tl.load(alibi_ptr + q_head_idx)
+        else:
+            alibi_slope = 0.0
+        if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
+                offs_n, offs_d, win_m_lo, win_m_hi, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+        else:
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
+                offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
+                offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, False, IS_CAUSAL, softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+            dk, dv = _bwd_dkdv_inner(
+                dk, dv, k, v, q_base, do_base, lse_base, delta_base,
+                stride_qt, stride_qd, stride_dot, stride_dod, stride_lt, stride_det,
+                offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
+                BLOCK_M, HEAD_DIM, True, IS_CAUSAL, softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
 
     dk *= softmax_scale
     token_n = k_start.to(tl.int64) + offs_n
@@ -233,10 +285,13 @@ def _attention_bwd_dq_varlen(
     stride_lh, stride_lt,
     stride_deh, stride_det,
     stride_dqt, stride_dqh, stride_dqd,
+    alibi_ptr,
     num_heads,
     max_seqlen_q_bucket, max_seqlen_k_bucket,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr = -1, WINDOW_RIGHT: tl.constexpr = -1,
+    softcap=0.0, HAS_SOFTCAP: tl.constexpr = False, HAS_ALIBI: tl.constexpr = False,
 ):
     block_m_idx = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -267,24 +322,48 @@ def _attention_bwd_dq_varlen(
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     k_base = k_ptr + k_start.to(tl.int64) * stride_kt + kv_head_idx * stride_kh
     v_base = v_ptr + k_start.to(tl.int64) * stride_vt + kv_head_idx * stride_vh
-
-    if IS_CAUSAL:
-        max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
-        unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+    if HAS_ALIBI:
+        alibi_slope = tl.load(alibi_ptr + head_idx)
     else:
-        max_n = seqlen_k
-        unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
+        alibi_slope = 0.0
 
-    dq = _bwd_dq_inner(
-        dq, q, do, lse, delta, k_base, v_base,
-        stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_N, HEAD_DIM, False, IS_CAUSAL)
-    dq = _bwd_dq_inner(
-        dq, q, do, lse, delta, k_base, v_base,
-        stride_kt, stride_kd, stride_vt, stride_vd,
-        offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
-        BLOCK_N, HEAD_DIM, True, IS_CAUSAL)
+    if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+        if WINDOW_LEFT >= 0:
+            win_lo = tl.maximum(block_m_idx * BLOCK_M - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+        else:
+            win_lo = 0
+        if IS_CAUSAL:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+        elif WINDOW_RIGHT >= 0:
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
+        else:
+            win_hi = seqlen_k
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, win_lo, win_hi, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+    else:
+        if IS_CAUSAL:
+            max_n = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M)
+            unmasked_n = tl.minimum(block_m_idx * BLOCK_M, seqlen_k) // BLOCK_N * BLOCK_N
+        else:
+            max_n = seqlen_k
+            unmasked_n = seqlen_k // BLOCK_N * BLOCK_N
+
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, False, IS_CAUSAL,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
+        dq = _bwd_dq_inner(
+            dq, q, do, lse, delta, k_base, v_base,
+            stride_kt, stride_kd, stride_vt, stride_vd,
+            offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
+            BLOCK_N, HEAD_DIM, True, IS_CAUSAL,
+            softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP, alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI)
 
     dq *= softmax_scale
     dq_ptrs = dq_ptr + token[:, None] * stride_dqt + head_idx * stride_dqh + offs_d[None, :] * stride_dqd
