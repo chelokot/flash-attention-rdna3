@@ -61,8 +61,8 @@ def test_dispatch_routes_attn_mask():
 
 
 def test_dispatch_falls_back_for_unsupported_head_dim():
-    # head_dim 96 is unsupported by the kernel; the dispatcher must defer to the original.
-    query = torch.randn(1, 4, 256, 96, device="cuda", dtype=torch.float16)
+    # head_dim 640 is above the 512 cap; the dispatcher must defer to the original.
+    query = torch.randn(1, 4, 256, 640, device="cuda", dtype=torch.float16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
 
@@ -75,3 +75,36 @@ def test_dispatch_falls_back_for_unsupported_head_dim():
         disable_rdna3_flash_attention()
 
     torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
+
+
+def test_dispatch_defers_tiny_sequence_in_training():
+    # A very short sequence with grad enabled must defer to torch (its backward
+    # wins there); the same shape under no_grad must stay on the kernel.
+    import fa_rdna3.sdpa as sdpa_mod
+
+    tiny = lambda: torch.randn(1, 8, 12, 128, device="cuda", dtype=torch.float16, requires_grad=True)
+    big = torch.randn(2, 8, 512, 128, device="cuda", dtype=torch.float16, requires_grad=True)
+
+    enable_rdna3_flash_attention()
+    try:
+        real_orig = sdpa_mod._original_sdpa
+        deferrals = {"n": 0}
+
+        def spy(*args, **kwargs):
+            deferrals["n"] += 1
+            return real_orig(*args, **kwargs)
+
+        sdpa_mod._original_sdpa = spy
+
+        F.scaled_dot_product_attention(tiny(), tiny(), tiny(), is_causal=True)
+        assert deferrals["n"] == 1  # tiny + grad -> deferred
+
+        with torch.no_grad():
+            F.scaled_dot_product_attention(tiny(), tiny(), tiny(), is_causal=True)
+        assert deferrals["n"] == 1  # tiny + no_grad -> kept on kernel
+
+        F.scaled_dot_product_attention(big, big, big, is_causal=True)
+        assert deferrals["n"] == 1  # long + grad -> kept on kernel
+    finally:
+        sdpa_mod._original_sdpa = real_orig
+        disable_rdna3_flash_attention()

@@ -18,6 +18,14 @@ _original_sdpa = None
 _DECODE_MAX_QUERY = 8
 _DECODE_MIN_KEY = 1024
 
+# For very short sequences our backward launches three separate kernels whose
+# fixed overhead dominates the trivial compute, so torch's fused math backward
+# wins (measured: 12-token GQA fwd+bwd 0.68ms vs 0.50ms). The forward alone still
+# wins, so only step aside when a backward will follow (grad enabled). torch's
+# math backward is cheap and stable at this size — unlike its large-S path, which
+# is the erratic one we exist to replace, so the threshold stays deliberately low.
+_MIN_TRAIN_SEQLEN = 16
+
 
 def _is_supported(query, key, value, dropout_p):
     return (
@@ -45,6 +53,10 @@ def _mask_to_bias(attn_mask):
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
     if _is_supported(query, key, value, dropout_p):
+        if (torch.is_grad_enabled()
+                and query.shape[-2] <= _MIN_TRAIN_SEQLEN and key.shape[-2] <= _MIN_TRAIN_SEQLEN):
+            return _original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                                  is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
         bias = _mask_to_bias(attn_mask)
         if (bias is None and not is_causal and not torch.is_grad_enabled()
                 and query.dtype in (torch.float16, torch.bfloat16)
