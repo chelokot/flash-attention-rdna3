@@ -3,7 +3,7 @@
 import triton
 import triton.language as tl
 
-from ._common import LOG2E, _autotune_bench, _bwd_configs, _bwd_dkdv_inner, _bwd_dq_inner
+from ._common import LOG2E, _autotune_bench, _bwd_configs, _bwd_dkdv_inner, _bwd_dq_inner, _prune_configs_by_head_dim
 
 
 @triton.jit
@@ -39,7 +39,8 @@ def _attention_bwd_preprocess(
 
 @triton.autotune(configs=_bwd_configs(),
                  key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
-                 do_bench=_autotune_bench)
+                 do_bench=_autotune_bench,
+                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
 @triton.jit
 def _attention_bwd_dkdv(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dk_ptr, dv_ptr,
@@ -184,7 +185,8 @@ def _attention_bwd_dkdv(
 
 @triton.autotune(configs=_bwd_configs(),
                  key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
-                 do_bench=_autotune_bench)
+                 do_bench=_autotune_bench,
+                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
 @triton.jit
 def _attention_bwd_dq(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dq_ptr,

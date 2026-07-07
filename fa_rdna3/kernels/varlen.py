@@ -3,13 +3,14 @@
 import triton
 import triton.language as tl
 
-from ._common import LOG2E, _autotune_bench, _fwd_configs, _bwd_configs, _attention_inner, _bwd_dkdv_inner, _bwd_dq_inner
+from ._common import LOG2E, _autotune_bench, _fwd_configs, _bwd_configs, _attention_inner, _bwd_dkdv_inner, _bwd_dq_inner, _prune_configs_by_head_dim
 
 
 @triton.autotune(
     configs=_fwd_configs(),
     key=["max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
     do_bench=_autotune_bench,
+    prune_configs_by={"early_config_prune": _prune_configs_by_head_dim},
 )
 @triton.jit
 def _attention_forward_varlen(
@@ -151,7 +152,8 @@ def _attention_bwd_preprocess_varlen(
 
 @triton.autotune(configs=_bwd_configs(),
                  key=["max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
-                 do_bench=_autotune_bench)
+                 do_bench=_autotune_bench,
+                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
 @triton.jit
 def _attention_bwd_dkdv_varlen(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dk_ptr, dv_ptr,
@@ -272,7 +274,8 @@ def _attention_bwd_dkdv_varlen(
 
 @triton.autotune(configs=_bwd_configs(),
                  key=["max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
-                 do_bench=_autotune_bench)
+                 do_bench=_autotune_bench,
+                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
 @triton.jit
 def _attention_bwd_dq_varlen(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dq_ptr,

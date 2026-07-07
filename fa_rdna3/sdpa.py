@@ -24,7 +24,7 @@ def _is_supported(query, key, value, dropout_p):
         query.is_cuda
         and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and query.dim() == 4
-        and query.shape[-1] <= 256  # non-power-of-two dims are padded internally
+        and query.shape[-1] <= 512  # non-power-of-two dims are padded internally
         and key.shape[-1] == query.shape[-1]
         and value.shape[-1] == query.shape[-1]
         and key.shape[-2] == value.shape[-2]

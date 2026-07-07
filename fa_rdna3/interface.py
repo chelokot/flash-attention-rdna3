@@ -27,7 +27,7 @@ from .kernels import (
     _attention_decode_paged,
 )
 
-_SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256)
+_SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256, 512)
 
 # gfx1100 (RX 7900 XTX) has 96 compute units; aim to launch a couple of
 # workgroups per CU so a tiny-query decode saturates the machine.

@@ -59,6 +59,25 @@ def _bwd_configs():
     # applies and small tiles dominate. Reuse the validated forward geometries.
     return _fwd_configs()
 
+
+# A tile's fp32 accumulator and K/V staging scale with tile_rows * head_dim. At
+# head_dim 128 even the 128x128 tile is only 16K elements, but at head_dim 512 it
+# is 64K — far past the register file / 64 KB LDS, so those configs either fail to
+# fit or are pathologically slow to compile-and-benchmark during autotuning. Prune
+# oversized tiles per head_dim: head_dim <= 256 is untouched (the common path),
+# large head_dim keeps only the tiles that actually fit.
+_TILE_HEAD_DIM_BUDGET = 32768
+
+
+def _prune_configs_by_head_dim(configs, named_args, **kwargs):
+    head_dim = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
+    if head_dim is None or head_dim <= 256:
+        return configs
+    kept = [c for c in configs
+            if c.kwargs["BLOCK_M"] * head_dim <= _TILE_HEAD_DIM_BUDGET
+            and c.kwargs["BLOCK_N"] * head_dim <= _TILE_HEAD_DIM_BUDGET]
+    return kept or configs
+
 def _split_configs():
     # Decode is memory-bound on the KV load, so favour small key tiles and few
     # warps; the miscompile blacklist still applies to the WMMA in the partial.
