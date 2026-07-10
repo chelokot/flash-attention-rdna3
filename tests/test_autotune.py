@@ -12,6 +12,8 @@ from fa_rdna3.kernels import (
     _attention_split,
 )
 from fa_rdna3.kernels._common import (
+    _D64_BACKWARD_DKDV_GEOMETRY,
+    _D64_BACKWARD_DQ_GEOMETRY,
     _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY,
     _D64_NONCAUSAL_NARROW_GEOMETRY,
     _FP32_BACKWARD_GEOMETRY,
@@ -61,8 +63,8 @@ def test_batched_autotune_keys_cover_codegen_features():
 def test_production_config_spaces_stay_bounded_and_blacklist_free():
     expected_counts = {
         _attention_forward: 9,
-        _attention_bwd_dkdv: 8,
-        _attention_bwd_dq: 7,
+        _attention_bwd_dkdv: 9,
+        _attention_bwd_dq: 8,
         _attention_forward_varlen: 7,
         _attention_bwd_dkdv_varlen: 8,
         _attention_bwd_dq_varlen: 7,
@@ -106,6 +108,55 @@ def test_float32_backward_prunes_nonreturning_geometries():
         }
         assert geometries == {_FP32_BACKWARD_GEOMETRY}
         assert geometries.isdisjoint(blocked)
+
+
+def test_plain_dense_d64_backward_uses_measured_specializations():
+    common = {
+        "HEAD_DIM": 64,
+        "GROUP_SIZE": 1,
+        "seqlen_q": 4096,
+        "seqlen_k": 4096,
+    }
+    for dtype in (torch.float16, torch.bfloat16):
+        for kernel, prune, expected in (
+            (_attention_bwd_dkdv, _prune_bwd_dkdv_configs, _D64_BACKWARD_DKDV_GEOMETRY),
+            (_attention_bwd_dq, _prune_bwd_dq_configs, _D64_BACKWARD_DQ_GEOMETRY),
+        ):
+            kept = prune(kernel.configs, {**common, "q_ptr": torch.empty(1, dtype=dtype)})
+            geometries = {
+                (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+                for config in kept
+            }
+            assert geometries == {expected}
+
+
+def test_d64_backward_specializations_stay_dense_and_plain():
+    common = {
+        "HEAD_DIM": 64,
+        "GROUP_SIZE": 1,
+        "seqlen_q": 4096,
+        "seqlen_k": 4096,
+        "q_ptr": torch.empty(1, dtype=torch.float16),
+    }
+    exclusions = (
+        {"seqlen_q": None, "seqlen_k": None},
+        {"seqlen_q": 64, "seqlen_k": 64},
+        {"seqlen_k": 2048},
+        {"GROUP_SIZE": 2},
+        {"HAS_BIAS": True},
+        {"q_ptr": torch.empty(1, dtype=torch.float32)},
+    )
+    for kernel, prune, specialization in (
+        (_attention_bwd_dkdv, _prune_bwd_dkdv_configs, _D64_BACKWARD_DKDV_GEOMETRY),
+        (_attention_bwd_dq, _prune_bwd_dq_configs, _D64_BACKWARD_DQ_GEOMETRY),
+    ):
+        for exclusion in exclusions:
+            kept = prune(kernel.configs, {**common, **exclusion})
+            geometries = {
+                (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+                for config in kept
+            }
+            assert specialization not in geometries
 
 
 def test_plain_d64_noncausal_uses_measured_parallelism_specialization():

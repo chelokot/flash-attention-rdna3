@@ -183,7 +183,7 @@ def _attention_bwd_preprocess_varlen(
     tl.store(delta_ptr + head_idx * stride_dh + token * stride_dt, delta, mask=offs_m < seqlen_q)
 
 
-@triton.autotune(configs=_bwd_dkdv_configs(),
+@triton.autotune(configs=_bwd_dkdv_configs(include_d64_specialization=False),
                  key=["max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
                       "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_ALIBI"],
                  do_bench=_autotune_bench,
@@ -315,7 +315,7 @@ def _attention_bwd_dkdv_varlen(
     tl.store(dv_ptrs, dv.to(dv_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
 
 
-@triton.autotune(configs=_bwd_dq_configs(),
+@triton.autotune(configs=_bwd_dq_configs(include_d64_specialization=False),
                  key=["max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
                       "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_ALIBI"],
                  do_bench=_autotune_bench,

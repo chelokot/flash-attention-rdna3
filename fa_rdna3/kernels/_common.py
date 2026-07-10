@@ -44,6 +44,8 @@ _NONRETURNING_FP32_DQ = {(64, 64, 2)}
 _FP32_BACKWARD_GEOMETRY = (64, 32, 4)
 _D64_NONCAUSAL_NARROW_GEOMETRY = (64, 16, 4)
 _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY = (32, 64, 2)
+_D64_BACKWARD_DKDV_GEOMETRY = (16, 32, 2)
+_D64_BACKWARD_DQ_GEOMETRY = (64, 16, 4)
 
 
 # The exhaustive grid remains in bench/config_sweep.py. Production keeps every
@@ -75,21 +77,27 @@ def _fwd_configs(include_d64_specializations=True):
     return _configs_from_geometries(geometries)
 
 
-def _bwd_dkdv_configs():
-    return _configs_from_geometries((
+def _bwd_dkdv_configs(include_d64_specialization=True):
+    geometries = (
         (64, 32, 2), (64, 32, 4), (64, 32, 8),
         (64, 64, 2), (64, 64, 8),
         (64, 128, 4), (64, 128, 8),
         (128, 64, 4),
-    ))
+    )
+    if include_d64_specialization:
+        geometries = (_D64_BACKWARD_DKDV_GEOMETRY,) + geometries
+    return _configs_from_geometries(geometries)
 
 
-def _bwd_dq_configs():
-    return _configs_from_geometries((
+def _bwd_dq_configs(include_d64_specialization=True):
+    geometries = (
         (64, 32, 2), (64, 32, 4), (64, 32, 8),
         (64, 64, 2), (64, 64, 8),
         (128, 32, 4), (128, 32, 8),
-    ))
+    )
+    if include_d64_specialization:
+        geometries = (_D64_BACKWARD_DQ_GEOMETRY,) + geometries
+    return _configs_from_geometries(geometries)
 
 
 # A tile's fp32 accumulator and K/V staging scale with tile_rows * head_dim. At
@@ -155,21 +163,49 @@ def _prune_configs_by_head_dim(configs, named_args, **kwargs):
     return kept or configs
 
 
-def _prune_backward_configs(configs, named_args, **kwargs):
+def _prune_backward_configs(configs, named_args, d64_geometry, **kwargs):
     query = named_args.get("q_ptr")
     if query is not None and query.element_size() == 4:
         return [config for config in configs if (
             config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
         ) == _FP32_BACKWARD_GEOMETRY]
-    return _prune_configs_by_head_dim(configs, named_args, **kwargs)
+    head_dim = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
+    seqlen_q = named_args.get("seqlen_q")
+    seqlen_k = named_args.get("seqlen_k")
+    plain_dense_d64 = (
+        query is not None
+        and query.element_size() == 2
+        and head_dim == 64
+        and seqlen_q is not None
+        and seqlen_q == seqlen_k
+        and seqlen_q >= 128
+        and kwargs.get("GROUP_SIZE", named_args.get("GROUP_SIZE")) == 1
+        and kwargs.get("WINDOW_LEFT", named_args.get("WINDOW_LEFT", -1)) < 0
+        and kwargs.get("WINDOW_RIGHT", named_args.get("WINDOW_RIGHT", -1)) < 0
+        and not kwargs.get("HAS_SOFTCAP", named_args.get("HAS_SOFTCAP", False))
+        and not kwargs.get("HAS_BIAS", named_args.get("HAS_BIAS", False))
+        and not kwargs.get("HAS_ALIBI", named_args.get("HAS_ALIBI", False))
+        and not kwargs.get("DROPOUT", named_args.get("DROPOUT", False))
+        and not kwargs.get("SAFE_SOFTMAX", named_args.get("SAFE_SOFTMAX", False))
+    )
+    if plain_dense_d64:
+        return [config for config in configs if (
+            config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
+        ) == d64_geometry]
+    kept = [config for config in configs if (
+        config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
+    ) != d64_geometry]
+    return _prune_configs_by_head_dim(kept, named_args, **kwargs)
 
 
 def _prune_bwd_dkdv_configs(configs, named_args, **kwargs):
-    return _prune_backward_configs(configs, named_args, **kwargs)
+    return _prune_backward_configs(
+        configs, named_args, _D64_BACKWARD_DKDV_GEOMETRY, **kwargs)
 
 
 def _prune_bwd_dq_configs(configs, named_args, **kwargs):
-    return _prune_backward_configs(configs, named_args, **kwargs)
+    return _prune_backward_configs(
+        configs, named_args, _D64_BACKWARD_DQ_GEOMETRY, **kwargs)
 
 
 def _split_configs():
