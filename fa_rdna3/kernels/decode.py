@@ -7,7 +7,8 @@ from ._common import LOG2E, _autotune_bench, _split_configs, _attention_inner
 
 
 @triton.autotune(configs=_split_configs(),
-                 key=["seqlen_k_bucket", "HEAD_DIM"], do_bench=_autotune_bench)
+                 key=["seqlen_k_bucket", "HEAD_DIM", "GROUP_SIZE"], do_bench=_autotune_bench,
+                 cache_results=True)
 @triton.jit
 def _attention_split(
     q_ptr, k_ptr, v_ptr, o_partial_ptr, lse_partial_ptr,
@@ -102,20 +103,23 @@ def _attention_combine(
         lse_s = tl.load(lse_head + s * stride_lps + offs_m * stride_lpm,
                         mask=row_mask, other=float("-inf"))
         m_global = tl.maximum(m_global, lse_s)
+    has_any = m_global != float("-inf")
+    m_safe = tl.where(has_any, m_global, 0.0)
 
     denom = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for s in range(0, num_splits, 1):
         lse_s = tl.load(lse_head + s * stride_lps + offs_m * stride_lpm,
                         mask=row_mask, other=float("-inf"))
-        weight = tl.exp(lse_s - m_global)
+        weight = tl.where(lse_s != float("-inf"), tl.exp(lse_s - m_safe), 0.0)
         denom += weight
         o_ptrs = (o_head + s * stride_ops + offs_m[:, None] * stride_opm
                   + offs_d[None, :] * stride_opd)
         o_s = tl.load(o_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
         acc += weight[:, None] * o_s
 
-    out = acc / denom[:, None]
+    denom_safe = tl.where(denom == 0.0, 1.0, denom)
+    out = acc / denom_safe[:, None]
     out_base = out_ptr + batch_idx * stride_ob + head_idx * stride_oh
     out_ptrs = out_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)

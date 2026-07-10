@@ -28,7 +28,7 @@ def reference(query, key, value, lengths, causal, scale, window, softcap, slopes
         row = torch.arange(L, device=DEVICE)[:, None]
         col = torch.arange(L, device=DEVICE)[None, :]
         if slopes is not None:
-            logits = logits + slopes.view(-1, 1, 1) * (col - row).float()
+            logits = logits - slopes.view(-1, 1, 1) * (col - row).abs().float()
         keep = torch.ones(L, L, dtype=torch.bool, device=DEVICE)
         if causal:
             keep &= row >= col

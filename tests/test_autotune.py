@@ -1,0 +1,105 @@
+"""Autotune policy shared by the production kernel entry points."""
+
+import torch
+
+from fa_rdna3.kernels import (
+    _attention_bwd_dkdv,
+    _attention_bwd_dkdv_varlen,
+    _attention_bwd_dq,
+    _attention_bwd_dq_varlen,
+    _attention_forward,
+    _attention_forward_varlen,
+    _attention_split,
+)
+from fa_rdna3.kernels._common import (
+    _FP32_BACKWARD_GEOMETRY,
+    _MISCOMPILED_BF16_POST_SCALE,
+    _MISCOMPILED_ON_GFX1100,
+    _NONRETURNING_FP32_DKDV,
+    _NONRETURNING_FP32_DQ,
+    _prune_bwd_dkdv_configs,
+    _prune_bwd_dq_configs,
+    _prune_configs_by_head_dim,
+)
+
+
+AUTOTUNED_KERNELS = (
+    _attention_forward,
+    _attention_bwd_dkdv,
+    _attention_bwd_dq,
+    _attention_forward_varlen,
+    _attention_bwd_dkdv_varlen,
+    _attention_bwd_dq_varlen,
+    _attention_split,
+)
+
+
+def test_autotune_results_are_cached_across_processes():
+    assert all(kernel.cache_results for kernel in AUTOTUNED_KERNELS)
+
+
+def test_batched_autotune_keys_cover_codegen_features():
+    required = {
+        "GROUP_SIZE",
+        "WINDOW_LEFT",
+        "WINDOW_RIGHT",
+        "HAS_SOFTCAP",
+        "HAS_BIAS",
+        "HAS_ALIBI",
+        "DROPOUT",
+        "SAFE_SOFTMAX",
+    }
+    for kernel in (_attention_forward, _attention_bwd_dkdv, _attention_bwd_dq):
+        assert required <= set(kernel.keys)
+    assert "POST_SCALE_Q" in _attention_forward.keys
+    assert "POST_SCALE_Q" in _attention_forward_varlen.keys
+
+
+def test_production_config_spaces_stay_bounded_and_blacklist_free():
+    expected_counts = {
+        _attention_forward: 7,
+        _attention_bwd_dkdv: 8,
+        _attention_bwd_dq: 7,
+        _attention_forward_varlen: 7,
+        _attention_bwd_dkdv_varlen: 8,
+        _attention_bwd_dq_varlen: 7,
+        _attention_split: 6,
+    }
+    for kernel, expected_count in expected_counts.items():
+        assert len(kernel.configs) == expected_count
+        for config in kernel.configs:
+            if "BLOCK_M" in config.kwargs:
+                geometry = (
+                    config.kwargs["BLOCK_M"],
+                    config.kwargs["BLOCK_N"],
+                    config.num_warps,
+                )
+                assert geometry not in _MISCOMPILED_ON_GFX1100
+
+
+def test_bfloat16_post_scale_prunes_unstable_geometry():
+    kept = _prune_configs_by_head_dim(
+        _attention_forward.configs,
+        {"HEAD_DIM": 64, "POST_SCALE_Q": True},
+    )
+    geometries = {
+        (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+        for config in kept
+    }
+    assert geometries.isdisjoint(_MISCOMPILED_BF16_POST_SCALE)
+
+
+def test_float32_backward_prunes_nonreturning_geometries():
+    query = torch.empty(1, dtype=torch.float32)
+    cases = (
+        (_attention_bwd_dkdv, _prune_bwd_dkdv_configs, _NONRETURNING_FP32_DKDV),
+        (_attention_bwd_dq, _prune_bwd_dq_configs, _NONRETURNING_FP32_DQ),
+    )
+    for kernel, prune, blocked in cases:
+        kept = prune(kernel.configs, {"HEAD_DIM": 64, "q_ptr": query})
+        geometries = {
+            (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+            for config in kept
+        }
+        assert geometries == {_FP32_BACKWARD_GEOMETRY}
+        assert geometries.isdisjoint(blocked)

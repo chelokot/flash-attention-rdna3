@@ -3,7 +3,16 @@
 import triton
 import triton.language as tl
 
-from ._common import LOG2E, _autotune_bench, _bwd_configs, _bwd_dkdv_inner, _bwd_dq_inner, _prune_configs_by_head_dim
+from ._common import (
+    LOG2E,
+    _autotune_bench,
+    _bwd_dkdv_configs,
+    _bwd_dkdv_inner,
+    _bwd_dq_configs,
+    _bwd_dq_inner,
+    _prune_bwd_dkdv_configs,
+    _prune_bwd_dq_configs,
+)
 
 
 @triton.jit
@@ -37,10 +46,13 @@ def _attention_bwd_preprocess(
     tl.store(delta_ptrs, delta, mask=offs_m < seqlen_q)
 
 
-@triton.autotune(configs=_bwd_configs(),
-                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+@triton.autotune(configs=_bwd_dkdv_configs(),
+                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
+                      "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_BIAS", "HAS_ALIBI", "DROPOUT",
+                      "SAFE_SOFTMAX"],
                  do_bench=_autotune_bench,
-                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
+                 prune_configs_by={"early_config_prune": _prune_bwd_dkdv_configs},
+                 cache_results=True)
 @triton.jit
 def _attention_bwd_dkdv(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dk_ptr, dv_ptr,
@@ -64,6 +76,7 @@ def _attention_bwd_dkdv(
     HAS_BIAS: tl.constexpr = False,
     HAS_ALIBI: tl.constexpr = False,
     DROPOUT: tl.constexpr = False,
+    SAFE_SOFTMAX: tl.constexpr = False,
 ):
     """One K/V-head block per program; accumulate dK, dV by looping over query blocks.
 
@@ -101,11 +114,11 @@ def _attention_bwd_dkdv(
         if IS_CAUSAL:
             win_m_lo = tl.maximum(n_lo - causal_offset, 0) // BLOCK_M * BLOCK_M
         elif WINDOW_RIGHT >= 0:
-            win_m_lo = tl.maximum(n_lo - WINDOW_RIGHT, 0) // BLOCK_M * BLOCK_M
+            win_m_lo = tl.maximum(n_lo - causal_offset - WINDOW_RIGHT, 0) // BLOCK_M * BLOCK_M
         else:
             win_m_lo = 0
         if WINDOW_LEFT >= 0:
-            win_m_hi = tl.minimum(seqlen_q, (block_n_idx + 1) * BLOCK_N + WINDOW_LEFT)
+            win_m_hi = tl.minimum(seqlen_q, (block_n_idx + 1) * BLOCK_N - causal_offset + WINDOW_LEFT)
         else:
             win_m_hi = seqlen_q
     else:
@@ -141,6 +154,7 @@ def _attention_bwd_dkdv(
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, win_m_lo, win_m_hi, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
+                SAFE_LSE=SAFE_SOFTMAX,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
                 bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
                 alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -151,6 +165,7 @@ def _attention_bwd_dkdv(
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, start_m, unmasked_start, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
+                SAFE_LSE=SAFE_SOFTMAX,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
                 bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
                 alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -160,6 +175,7 @@ def _attention_bwd_dkdv(
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_start, unmasked_end, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, False, IS_CAUSAL,
+                SAFE_LSE=SAFE_SOFTMAX,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
                 bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
                 alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -169,6 +185,7 @@ def _attention_bwd_dkdv(
                 stride_qm, stride_qd, stride_dom, stride_dod, stride_lm, stride_dem,
                 offs_n, offs_d, unmasked_end, seqlen_q, seqlen_q, seqlen_k, qk_scale,
                 BLOCK_M, HEAD_DIM, True, IS_CAUSAL,
+                SAFE_LSE=SAFE_SOFTMAX,
                 softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
                 bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
                 alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -183,10 +200,13 @@ def _attention_bwd_dkdv(
     tl.store(dv_ptrs, dv.to(dv_ptr.dtype.element_ty), mask=offs_n[:, None] < seqlen_k)
 
 
-@triton.autotune(configs=_bwd_configs(),
-                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+@triton.autotune(configs=_bwd_dq_configs(),
+                 key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
+                      "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_BIAS", "HAS_ALIBI", "DROPOUT",
+                      "SAFE_SOFTMAX"],
                  do_bench=_autotune_bench,
-                 prune_configs_by={"early_config_prune": _prune_configs_by_head_dim})
+                 prune_configs_by={"early_config_prune": _prune_bwd_dq_configs},
+                 cache_results=True)
 @triton.jit
 def _attention_bwd_dq(
     q_ptr, k_ptr, v_ptr, dout_ptr, lse_ptr, delta_ptr, dq_ptr,
@@ -209,6 +229,7 @@ def _attention_bwd_dq(
     HAS_BIAS: tl.constexpr = False,
     HAS_ALIBI: tl.constexpr = False,
     DROPOUT: tl.constexpr = False,
+    SAFE_SOFTMAX: tl.constexpr = False,
 ):
     """One query block per program; accumulate dQ by looping over key blocks."""
     block_m_idx = tl.program_id(0)
@@ -247,13 +268,13 @@ def _attention_bwd_dq(
 
     if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
         if WINDOW_LEFT >= 0:
-            win_lo = tl.maximum(block_m_idx * BLOCK_M - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+            win_lo = tl.maximum(block_m_idx * BLOCK_M + causal_offset - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
         else:
             win_lo = 0
         if IS_CAUSAL:
             win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
         elif WINDOW_RIGHT >= 0:
-            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset + WINDOW_RIGHT)
         else:
             win_hi = seqlen_k
         dq = _bwd_dq_inner(
@@ -261,6 +282,7 @@ def _attention_bwd_dq(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, win_lo, win_hi, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, WINDOW_LEFT, WINDOW_RIGHT,
+            SAFE_LSE=SAFE_SOFTMAX,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -278,6 +300,7 @@ def _attention_bwd_dq(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, 0, unmasked_n, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, False, IS_CAUSAL,
+            SAFE_LSE=SAFE_SOFTMAX,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -287,6 +310,7 @@ def _attention_bwd_dq(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, unmasked_n, max_n, seqlen_q, seqlen_k, qk_scale,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL,
+            SAFE_LSE=SAFE_SOFTMAX,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,

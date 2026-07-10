@@ -15,22 +15,27 @@ from ._common import LOG2E
 
 @triton.jit
 def _attention_decode_paged(
-    q_ptr, k_cache_ptr, v_cache_ptr, out_ptr, block_table_ptr, context_lens_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, out_ptr, lse_ptr, block_table_ptr, context_lens_ptr,
     softmax_scale,
     stride_qb, stride_qh, stride_qd,
     stride_kblk, stride_kpos, stride_kh, stride_kd,
     stride_vblk, stride_vpos, stride_vh, stride_vd,
-    stride_ob, stride_oh, stride_od,
+    stride_ob, stride_oh, stride_os, stride_od,
+    stride_lb, stride_lh, stride_ls,
     stride_btb, stride_btk,
-    num_heads,
+    stride_clb,
+    num_heads, num_cache_blocks, max_table_blocks, num_splits,
     HEAD_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    split_idx = tl.program_id(0)
+    pid = tl.program_id(1)
     batch_idx = (pid // num_heads).to(tl.int64)
     head_idx = (pid % num_heads).to(tl.int64)
     kv_head_idx = head_idx // GROUP_SIZE
 
-    context_len = tl.load(context_lens_ptr + batch_idx)
+    context_len = tl.load(context_lens_ptr + batch_idx * stride_clb)
+    context_len = tl.minimum(tl.maximum(context_len, 0), max_table_blocks * BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_pos = tl.arange(0, BLOCK_SIZE)
 
@@ -42,10 +47,16 @@ def _attention_decode_paged(
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
     num_blocks = tl.cdiv(context_len, BLOCK_SIZE)
-    for blk in range(0, num_blocks, 1):
+    blocks_per_split = num_blocks // num_splits
+    extra_blocks = num_blocks % num_splits
+    block_begin = split_idx * blocks_per_split + tl.minimum(split_idx, extra_blocks)
+    block_count = blocks_per_split + (split_idx < extra_blocks).to(tl.int32)
+    block_end = block_begin + block_count
+    for blk in range(block_begin, block_end, 1):
         phys = tl.load(block_table_ptr + batch_idx * stride_btb + blk * stride_btk).to(tl.int64)
         pos = blk * BLOCK_SIZE + offs_pos
-        pos_mask = pos < context_len
+        valid_phys = (phys >= 0) & (phys < num_cache_blocks)
+        pos_mask = (pos < context_len) & valid_phys
 
         k_ptrs = (k_cache_ptr + phys * stride_kblk + offs_pos[:, None] * stride_kpos
                   + kv_head_idx * stride_kh + offs_d[None, :] * stride_kd)
@@ -54,8 +65,10 @@ def _attention_decode_paged(
         qk = tl.where(pos_mask, qk, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=0))
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(qk - m_new)
+        empty = m_new == float("-inf")
+        m_safe = tl.where(empty, 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(qk - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=0)
         acc = acc * alpha
 
@@ -63,8 +76,14 @@ def _attention_decode_paged(
                   + kv_head_idx * stride_vh + offs_d[None, :] * stride_vd)
         v = tl.load(v_ptrs, mask=pos_mask[:, None], other=0.0)
         acc += tl.sum(p[:, None] * v.to(tl.float32), axis=0)
-        m_i = m_new
+        m_i = tl.where(empty, m_i, m_new)
 
-    out = acc / l_i
-    out_ptrs = out_ptr + batch_idx * stride_ob + head_idx * stride_oh + offs_d * stride_od
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    out = acc / l_safe
+    out_ptrs = (out_ptr + batch_idx * stride_ob + head_idx * stride_oh
+                + split_idx * stride_os + offs_d * stride_od)
     tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty))
+    if STORE_LSE:
+        lse = m_i / LOG2E + tl.log(l_safe)
+        lse_offset = batch_idx * stride_lb + head_idx * stride_lh + split_idx * stride_ls
+        tl.store(lse_ptr + lse_offset, lse)

@@ -78,6 +78,6 @@ def test_cross_attention_shapes():
 
 
 def test_rejects_unsupported_dtype():
-    query = torch.randn(1, 1, 64, 64, device=DEVICE, dtype=torch.float32)
+    query = torch.randn(1, 1, 64, 64, device=DEVICE, dtype=torch.float64)
     with pytest.raises(ValueError, match="unsupported dtype"):
         flash_attention(query, query, query)

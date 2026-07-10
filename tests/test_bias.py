@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from fa_rdna3 import flash_attention
+from fa_rdna3.interface import _bias_args
 
 DEVICE = "cuda"
 
@@ -17,7 +18,10 @@ DEVICE = "cuda"
 def reference_bias(query, key, value, scale, bias):
     logits = (torch.matmul(query, key.transpose(-1, -2)) * scale).float()
     logits = logits + bias.float()
-    return torch.matmul(torch.softmax(logits, dim=-1).to(value.dtype), value)
+    valid = torch.isfinite(logits).any(dim=-1, keepdim=True)
+    logits = torch.where(valid, logits, torch.zeros_like(logits))
+    probs = torch.where(valid, torch.softmax(logits, dim=-1), 0.0)
+    return torch.matmul(probs.to(value.dtype), value)
 
 
 def grads(fn, q, k, v, dout):
@@ -69,6 +73,55 @@ def test_bias_hard_mask():
     torch.testing.assert_close(out.float(), exact, atol=3e-3, rtol=3e-3)
 
 
+def test_bias_fully_masked_rows():
+    torch.manual_seed(17)
+    batch, heads, seqlen, head_dim = 1, 2, 256, 64
+    scale = 1.0 / math.sqrt(head_dim)
+    query = torch.randn(batch, heads, seqlen, head_dim, device=DEVICE, dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    query.requires_grad_(True)
+    key.requires_grad_(True)
+    value.requires_grad_(True)
+    bias = torch.zeros(batch, heads, seqlen, seqlen, device=DEVICE)
+    bias[:, :, :64] = float("-inf")
+
+    out = flash_attention(query, key, value, softmax_scale=scale, bias=bias)
+    exact = reference_bias(query.float(), key.float(), value.float(), scale, bias)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), exact, atol=3e-3, rtol=3e-3)
+
+    out.backward(torch.randn_like(out))
+    assert torch.isfinite(query.grad).all()
+    assert torch.isfinite(key.grad).all()
+    assert torch.isfinite(value.grad).all()
+    torch.testing.assert_close(query.grad[:, :, :64], torch.zeros_like(query.grad[:, :, :64]))
+
+
+def test_bias_masked_prefix_with_negative_logits():
+    batch, heads, seqlen, head_dim = 1, 2, 256, 64
+    query = torch.zeros(batch, heads, seqlen, head_dim, device=DEVICE, dtype=torch.float16)
+    key = torch.zeros_like(query)
+    value = torch.randn_like(query)
+    bias = torch.full((1, 1, 1, seqlen), -1000.0, device=DEVICE)
+    bias[..., :128] = float("-inf")
+
+    out = flash_attention(query, key, value, bias=bias)
+    expected = value[..., 128:, :].float().mean(dim=-2, keepdim=True).expand_as(out)
+
+    torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=3e-3)
+
+
+def test_low_precision_bias_is_not_materialized():
+    query = torch.empty(2, 4, 64, 64, device=DEVICE, dtype=torch.float16)
+    bias = torch.randn(1, 1, 64, 64, device=DEVICE, dtype=torch.float16)
+
+    expanded, *_ = _bias_args(bias, query, 2, 4, 64, 64)
+
+    assert expanded.dtype == bias.dtype
+    assert expanded.data_ptr() == bias.data_ptr()
+
+
 def test_bias_backward():
     torch.manual_seed(1)
     batch, heads, seqlen, head_dim = 2, 4, 512, 64
@@ -77,7 +130,7 @@ def test_bias_backward():
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     dout = torch.randn_like(q)
-    bias = torch.randn(batch, heads, seqlen, seqlen, device=DEVICE, dtype=torch.float32)
+    bias = torch.randn(batch, heads, seqlen, seqlen, device=DEVICE, dtype=torch.float16)
 
     kernel = grads(lambda q, k, v: flash_attention(q, k, v, softmax_scale=scale, bias=bias), q, k, v, dout)
     exact = grads(lambda q, k, v: reference_bias(q, k, v, scale, bias),

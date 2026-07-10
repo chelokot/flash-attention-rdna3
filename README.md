@@ -68,6 +68,39 @@ Decode is memory-bound; split-K reaches up to 865 GB/s of KV read bandwidth
 (≈90% of the card's ~960 GB/s peak). It helps most when few `batch × heads`
 would otherwise leave most of the GPU idle while one workgroup walks the cache.
 
+Paged-KV decode now splits the logical block table with the same LSE-correct
+reduction instead of assigning one serial cache walk to each query head:
+
+| batch × q heads / KV heads × context | serial paged | automatic split-K | speedup |
+|---|---:|---:|---:|
+| 1 × 8 / 8 × 256   | 35.2 µs  | 20.0 µs  | 1.76× |
+| 1 × 8 / 8 × 1024  | 155.3 µs | 28.0 µs  | 5.54× |
+| 1 × 8 / 8 × 4096  | 422.7 µs | 58.8 µs  | 7.19× |
+| 1 × 32 / 8 × 4096 | 419.8 µs | 102.0 µs | 4.12× |
+| 4 × 32 / 8 × 4096 | 526.6 µs | 327.6 µs | 1.61× |
+| 4 × 32 / 8 × 16384 | 2047.3 µs | 1208.1 µs | 1.69× |
+
+The automatic policy was checked against a forced-split oracle across context
+lengths 64–16384 and stays within 6% of its best measured split on the tested
+matrix. Short contexts at or below 64 tokens remain unsplit when the supplied
+`max_context_len` (or the block-table capacity used in its absence) reflects
+that bound.
+
+## Installation
+
+Install a matching ROCm build of PyTorch first. Its `pytorch-triton-rocm`
+package provides the Triton compiler that matches that PyTorch/ROCm release;
+`fa-rdna3` deliberately does not ask pip to install a second, potentially
+incompatible Triton distribution over it.
+
+The currently verified stack is Python 3.14, PyTorch 2.9.1 + ROCm 6.4, and
+`pytorch-triton-rocm` 3.5.1 on `gfx1100`. Verify the environment, then install:
+
+```bash
+python -c 'import torch, triton; print(torch.__version__, torch.version.hip, triton.__version__)'
+pip install -e .
+```
+
 ## Usage
 
 Direct call — tensors are `(batch, heads, seqlen, head_dim)`, fp16 or bf16.
@@ -93,6 +126,20 @@ from fa_rdna3 import flash_attention_decode
 out = flash_attention_decode(q_step, k_cache, v_cache)  # q_step is (b, h, 1, d)
 ```
 
+Paged-KV decode uses a vLLM-style physical block pool. `max_context_len` is an
+optional host-known upper bound used to choose the split count without reading
+the GPU `context_lens` tensor back to the CPU. `num_splits` is available as a
+manual 1–32 override for benchmarking or unusual workloads:
+
+```python
+from fa_rdna3 import flash_attention_decode_paged
+
+out = flash_attention_decode_paged(
+    q_step, k_blocks, v_blocks, block_table, context_lens,
+    max_context_len=4096,
+)
+```
+
 Variable-length packed sequences — concatenate without padding and pass
 cumulative lengths (`(total_tokens, heads, head_dim)` layout):
 
@@ -103,6 +150,11 @@ from fa_rdna3 import flash_attention_varlen
 out = flash_attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
                              max_seqlen_q, max_seqlen_k, causal=True)
 ```
+
+The cumulative arrays must start at zero, be monotonically nondecreasing, and
+end at the packed token totals; each `max_seqlen` must cover its longest
+segment. Kernels clamp intervals to the packed storage bounds for memory safety,
+but invalid metadata does not produce meaningful attention results.
 
 Transparent drop-in for ComfyUI / diffusers / transformers — installs an
 override of `torch.nn.functional.scaled_dot_product_attention` (float or
@@ -117,8 +169,9 @@ enable_rdna3_flash_attention()  # call once at startup
 
 ## Supported
 
-- Head dims up to 512 (incl. non-powers-of-two, zero-padded internally); 512 covers VAE spatial attention
-- fp16, bf16, and fp32
+- Dense head dims up to 512 (incl. non-powers-of-two, zero-padded internally);
+  packed and decode APIs use exact power-of-two dims from 16 through 512
+- Dense fp16, bf16, and fp32; packed/decode fp16 and bf16
 - Causal (bottom-right aligned for `seqlen_q != seqlen_k`) and full attention
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Logit soft-capping (`softcap`, e.g. Gemma2)
@@ -128,7 +181,7 @@ enable_rdna3_flash_attention()  # call once at startup
 - Registered as a `torch.library` custom op — `torch.compile`-compatible and `opcheck`-clean
 - Distinct query / key sequence lengths (cross-attention)
 - Grouped-query and multi-query attention (fewer K/V heads than query heads)
-- Forward **and backward** (autograd `Function`; deterministic gradients)
+- Forward **and backward** (registered autograd; deterministic gradients)
 - Split-K decode for the small-query / long-KV regime
 - Paged-KV decode over a block-table cache (`flash_attention_decode_paged`, vLLM-style)
 - Variable-length packed sequences via `cu_seqlens` (no padding), differentiable
@@ -140,17 +193,24 @@ pip install -e ".[test]"
 python -m pytest tests/            # forward, backward, and decode vs fp32 reference
 python bench/benchmark.py          # forward + backward, vs default SDPA
 python bench/decode_benchmark.py   # split-K decode, vs forward and SDPA
+python bench/paged_decode_benchmark.py  # paged split-K vs a serial cache walk
 python bench/gemm_ceiling.py       # sustained WMMA GEMM ceiling on this card
-python bench/config_sweep.py       # correctness of every autotune config
+python bench/config_sweep.py       # correctness of every forward tile config
 ```
 
-`config_sweep.py` exists because two `(tile, num_warps)` geometries
-(`64×64` at 4 warps, `128×128` at 8 warps) miscompile in the ROCm Triton WMMA
-backend on gfx1100 — they run fast enough to win autotuning but return large
-localized errors for some dtypes. The sweep found them (still reproducible on
-Triton 3.5.1 / ROCm 6.4); they are excluded from the kernel's search space
-(`_MISCOMPILED_ON_GFX1100` in `fa_rdna3/kernels/`) so autotuning can only ever
-select a numerically correct config.
+`config_sweep.py` exists because three `(tile, num_warps)` geometries
+(`64×64` at 4 warps, `128×64` at 8 warps, `128×128` at 8 warps) miscompile in
+the ROCm Triton WMMA backend on gfx1100 — they run fast enough to win autotuning
+but return large localized errors for some dtypes. A fourth geometry (`64×32`
+at 4 warps) is unstable specifically when bf16 Q scaling happens after the dot.
+The sweep found them (still reproducible on Triton 3.5.1 / ROCm 6.4); the first
+set is excluded globally and the conditional case only from bf16 forward, so
+autotuning can only select a numerically correct config. The production
+shortlist keeps every geometry observed as a winner or top-three runner-up; the
+benchmark retains the exhaustive grid for validating future compiler releases.
+Four fp32 backward geometries also do not return on gfx1100. fp32 backward uses
+one verified conservative geometry instead of cold-autotuning through fragile
+codegen; the primary fp16/bf16 paths retain their measured search spaces.
 
 ## How it works
 
@@ -159,12 +219,19 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
 
 - Autotuned block sizes over a grid sized for RDNA3's 32-lane WMMA fragments and
   the 64 KB per-workgroup LDS limit.
+- The measured production grids cut a training specialization from 45 compiled
+  candidates to 22 (forward 15→7, dK/dV 15→8, dQ 15→7), limiting first-use
+  latency and Triton disk-cache growth while retaining all observed winners.
+- Autotune selections are keyed by dtype, shape, GQA grouping, and enabled score
+  modifiers, then cached on disk so a new Python process does not benchmark the
+  same specialization again.
 - `num_stages=1` — RDNA3 has no `cp.async`/TMA equivalent, so deep software
   pipelining costs LDS without hiding latency the way it does on CUDA. Measured:
   `num_stages=2` is uniformly slower here.
-- The exponentials use `exp2` with `log2(e)` folded into the softmax scale (and
-  applied to `q` once before the loop), which maps to a native RDNA3
-  instruction.
+- The exponentials use `exp2` with `log2(e)` folded into the softmax scale,
+  which maps to a native RDNA3 instruction. fp16/fp32 apply it to `q` once;
+  bf16 applies it to the fp32 score so backward recomputation follows the same
+  arithmetic order and avoids a reproducible long-sequence gradient error.
 - V is loaded at the top of the key loop, before the QK dot, so its global-load
   latency overlaps the QK matmul and the softmax (+3–7% at head_dim 128).
 - The inner key loop is split into an unmasked region (full tiles below the
@@ -177,9 +244,17 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
   dQ accumulation race-free without atomics (deterministic gradients). P is
   recomputed from Q, K and the stored LSE; the `log2(e)` factor on the LSE ties
   the base-2 forward softmax to the natural-log LSE.
+- dQ and dK/dV use separate measured autotune spaces. This keeps every observed
+  winning geometry while cutting cold backward candidates from 30 to 15 per
+  specialization.
 - Decode splits the KV cache across workgroups (each computes a partial output
   and LSE) and merges the partials with an LSE reduction, so a one-row query
   saturates the GPU instead of leaving one workgroup to walk the whole cache.
+- Paged decode applies the same LSE-correct split/merge directly over a physical
+  block table, clamps malformed lengths and block ids safely, and selects its
+  split count from both GPU occupancy and serial work per program.
+- Low-precision additive bias is consumed directly by the kernel; it is never
+  expanded or copied into a materialised fp32 attention matrix.
 
 ## Acknowledgements
 

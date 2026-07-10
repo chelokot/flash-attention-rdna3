@@ -58,7 +58,6 @@ def test_dropout_backward_consistency():
     eps = 0.1
     for grad, tensor, name in ((dq, q, "dq"), (dk, k, "dk"), (dv, v, "dv")):
         direction = torch.randn_like(tensor)
-        pert = {"dq": q, "dk": k, "dv": v}
         perturbed = {k_: t.clone() for k_, t in (("dq", q), ("dk", k), ("dv", v))}
         perturbed[name] = tensor + eps * direction
         out2, _ = _forward(perturbed["dq"], perturbed["dk"], perturbed["dv"],

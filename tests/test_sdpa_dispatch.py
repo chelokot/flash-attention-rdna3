@@ -1,9 +1,14 @@
 """The SDPA dispatch routes supported calls and defers to the original otherwise."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
-from fa_rdna3.sdpa import enable_rdna3_flash_attention, disable_rdna3_flash_attention
+from fa_rdna3.sdpa import (
+    disable_rdna3_flash_attention,
+    enable_rdna3_flash_attention,
+    use_rdna3_flash_attention,
+)
 
 
 def test_dispatch_matches_reference_and_restores():
@@ -11,7 +16,8 @@ def test_dispatch_matches_reference_and_restores():
     key = torch.randn_like(query)
     value = torch.randn_like(query)
 
-    baseline = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+    original = F.scaled_dot_product_attention
+    baseline = original(query, key, value, is_causal=True)
 
     enable_rdna3_flash_attention()
     try:
@@ -19,7 +25,7 @@ def test_dispatch_matches_reference_and_restores():
     finally:
         disable_rdna3_flash_attention()
 
-    assert F.scaled_dot_product_attention is not None
+    assert F.scaled_dot_product_attention is original
     torch.testing.assert_close(dispatched.float(), baseline.float(), atol=3e-3, rtol=3e-3)
 
 
@@ -77,6 +83,28 @@ def test_dispatch_falls_back_for_unsupported_head_dim():
     torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
 
 
+def test_dispatch_preserves_pytorch_causal_cross_attention_alignment():
+    query = torch.zeros(1, 1, 1, 16, device="cuda", dtype=torch.float16)
+    key = torch.zeros(1, 1, 3, 16, device="cuda", dtype=torch.float16)
+    values = torch.tensor([1.0, 2.0, 4.0], device="cuda", dtype=torch.float16)
+    value = values.view(1, 1, 3, 1).expand_as(key).contiguous()
+    reference = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+
+    with use_rdna3_flash_attention():
+        result = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+
+    torch.testing.assert_close(result, reference)
+
+
+def test_dispatch_preserves_causal_mask_rejection():
+    query = torch.randn(1, 1, 4, 16, device="cuda", dtype=torch.float16)
+    mask = torch.ones(4, 4, device="cuda", dtype=torch.bool)
+
+    with use_rdna3_flash_attention(), pytest.raises(RuntimeError):
+        F.scaled_dot_product_attention(
+            query, query, query, attn_mask=mask, is_causal=True)
+
+
 def test_dispatch_defers_tiny_sequence_in_training():
     # A very short sequence with grad enabled must defer to torch (its backward
     # wins there); the same shape under no_grad must stay on the kernel.
@@ -108,3 +136,95 @@ def test_dispatch_defers_tiny_sequence_in_training():
     finally:
         sdpa_mod._original_sdpa = real_orig
         disable_rdna3_flash_attention()
+
+
+def test_dispatch_respects_enable_gqa():
+    query = torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.float16)
+    key = torch.randn(1, 2, 64, 64, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+
+    with use_rdna3_flash_attention():
+        try:
+            F.scaled_dot_product_attention(query, key, value)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("different Q/KV head counts must require enable_gqa=True")
+
+        result = F.scaled_dot_product_attention(query, key, value, enable_gqa=True)
+
+    reference = F.scaled_dot_product_attention(query, key, value, enable_gqa=True)
+    torch.testing.assert_close(result.float(), reference.float(), atol=3e-3, rtol=3e-3)
+
+
+def test_dispatch_uses_decode_for_inference_tensors_with_grad_mode_enabled():
+    import fa_rdna3.sdpa as sdpa_mod
+
+    query = torch.randn(1, 8, 1, 128, device="cuda", dtype=torch.float16)
+    key = torch.randn(1, 8, 2048, 128, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    calls = {"decode": 0}
+    real_decode = sdpa_mod.flash_attention_decode
+
+    def spy(*args, **kwargs):
+        calls["decode"] += 1
+        return real_decode(*args, **kwargs)
+
+    sdpa_mod.flash_attention_decode = spy
+    try:
+        with use_rdna3_flash_attention():
+            F.scaled_dot_product_attention(query, key, value)
+    finally:
+        sdpa_mod.flash_attention_decode = real_decode
+
+    assert calls["decode"] == 1
+
+
+def test_disable_preserves_later_third_party_override():
+    original = F.scaled_dot_product_attention
+    query = torch.randn(1, 1, 4, 8)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    reference = original(query, key, value)
+
+    enable_rdna3_flash_attention()
+    installed = F.scaled_dot_product_attention
+
+    def third_party(*args, **kwargs):
+        return installed(*args, **kwargs)
+
+    F.scaled_dot_product_attention = third_party
+    disable_rdna3_flash_attention()
+    try:
+        assert F.scaled_dot_product_attention is third_party
+        result = F.scaled_dot_product_attention(query, key, value)
+        torch.testing.assert_close(result, reference)
+
+        enable_rdna3_flash_attention()
+        assert F.scaled_dot_product_attention is third_party
+    finally:
+        F.scaled_dot_product_attention = original
+
+
+def test_context_manager_is_nestable():
+    original = F.scaled_dot_product_attention
+    with use_rdna3_flash_attention():
+        installed = F.scaled_dot_product_attention
+        with use_rdna3_flash_attention():
+            assert F.scaled_dot_product_attention is installed
+        assert F.scaled_dot_product_attention is installed
+    assert F.scaled_dot_product_attention is original
+
+
+def test_context_manager_overlaps_are_refcounted():
+    original = F.scaled_dot_product_attention
+    first = use_rdna3_flash_attention()
+    second = use_rdna3_flash_attention()
+
+    first.__enter__()
+    installed = F.scaled_dot_product_attention
+    second.__enter__()
+    first.__exit__(None, None, None)
+    assert F.scaled_dot_product_attention is installed
+    second.__exit__(None, None, None)
+    assert F.scaled_dot_product_attention is original

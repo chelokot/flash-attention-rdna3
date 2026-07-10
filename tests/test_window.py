@@ -1,4 +1,4 @@
-"""Sliding-window attention: query i attends keys in [i-left, i+right].
+"""Sliding-window attention with bottom-right query/key alignment.
 
 Convention matches Dao-AILab/flash-attention's ``window_size=(left, right)``
 (https://github.com/Dao-AILab/flash-attention).
@@ -22,15 +22,19 @@ def reference_window(query, key, value, causal, scale, window):
     logits = (torch.matmul(query, key.transpose(-1, -2)) * scale).float()
     row = torch.arange(sq, device=DEVICE)[:, None]
     col = torch.arange(sk, device=DEVICE)[None, :]
+    query_pos = row + sk - sq
     keep = torch.ones_like(logits, dtype=torch.bool)
     if causal:
-        keep &= row >= col
+        keep &= query_pos >= col
     if left >= 0:
-        keep &= col >= row - left
+        keep &= col >= query_pos - left
     if right >= 0:
-        keep &= col <= row + right
+        keep &= col <= query_pos + right
     logits = logits.masked_fill(~keep, float("-inf"))
-    return torch.matmul(torch.softmax(logits, dim=-1).to(value.dtype), value)
+    valid = keep.any(dim=-1, keepdim=True)
+    logits = torch.where(valid, logits, torch.zeros_like(logits))
+    probs = torch.where(valid, torch.softmax(logits, dim=-1), 0.0)
+    return torch.matmul(probs.to(value.dtype), value)
 
 
 def grads(fn, q, k, v, dout):
@@ -83,3 +87,26 @@ def test_window_backward(causal, window):
         ke = (kg.float() - eg).abs().max().item()
         ne = (ng.float() - eg).abs().max().item()
         assert ke <= 2.0 * ne + 1e-3, f"err {ke:.2e} vs naive {ne:.2e}"
+
+
+@pytest.mark.parametrize("causal,window", [(True, (31, 0)), (False, (16, 24))])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(96, 257), (257, 96)])
+def test_window_cross_attention(causal, window, seqlen_q, seqlen_k):
+    torch.manual_seed(11 + int(causal) + seqlen_q)
+    batch, heads, head_dim = 1, 2, 64
+    scale = 1.0 / math.sqrt(head_dim)
+    query = torch.randn(batch, heads, seqlen_q, head_dim, device=DEVICE, dtype=torch.float16)
+    key = torch.randn(batch, heads, seqlen_k, head_dim, device=DEVICE, dtype=torch.float16)
+    value = torch.randn_like(key)
+    dout = torch.randn_like(query)
+
+    fn = lambda q, k, v: flash_attention(q, k, v, causal, scale, window)
+    kernel = grads(fn, query, key, value, dout)
+    exact = grads(lambda q, k, v: reference_window(q, k, v, causal, scale, window),
+                  query.float(), key.float(), value.float(), dout.float())
+    naive = grads(lambda q, k, v: reference_window(q, k, v, causal, scale, window),
+                  query, key, value, dout)
+    for kernel_grad, naive_grad, exact_grad in zip(kernel, naive, exact):
+        kernel_err = (kernel_grad.float() - exact_grad).abs().max().item()
+        naive_err = (naive_grad.float() - exact_grad).abs().max().item()
+        assert kernel_err <= 2.0 * naive_err + 1e-3

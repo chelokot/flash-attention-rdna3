@@ -3,12 +3,12 @@ name = "fa-rdna3"
 version = "0.1.0"
 description = "FlashAttention-2 Triton kernel for AMD RDNA3 (gfx1100 / Radeon RX 7900 XT/XTX/GRE)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["torch>=2.5", "triton>=3.0"]
+dependencies = ["torch>=2.8"]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "ruff>=0.12"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -16,3 +16,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["fa_rdna3*"]
+
+[tool.ruff.lint]
+ignore = ["E731"]

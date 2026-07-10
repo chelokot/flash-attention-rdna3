@@ -3,14 +3,26 @@
 import triton
 import triton.language as tl
 
-from ._common import LOG2E, _autotune_bench, _fwd_configs, _attention_inner, _prune_configs_by_head_dim
+from ._common import (
+    LOG2E,
+    _attention_inner,
+    _autotune_bench,
+    _fwd_configs,
+    _prune_configs_by_head_dim,
+)
 
 
 @triton.autotune(
     configs=_fwd_configs(),
-    key=["seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL"],
+    key=[
+        "seqlen_q_bucket", "seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
+        "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_BIAS", "HAS_ALIBI", "DROPOUT",
+        "SAFE_SOFTMAX",
+        "POST_SCALE_Q",
+    ],
     do_bench=_autotune_bench,
     prune_configs_by={"early_config_prune": _prune_configs_by_head_dim},
+    cache_results=True,
 )
 @triton.jit
 def _attention_forward(
@@ -37,6 +49,8 @@ def _attention_forward(
     HAS_BIAS: tl.constexpr = False,
     HAS_ALIBI: tl.constexpr = False,
     DROPOUT: tl.constexpr = False,
+    SAFE_SOFTMAX: tl.constexpr = False,
+    POST_SCALE_Q: tl.constexpr = False,
     PRE_LOAD_V: tl.constexpr = True,
 ):
     tl.static_assert((HEAD_DIM & (HEAD_DIM - 1)) == 0, "HEAD_DIM must be a power of two")
@@ -66,7 +80,8 @@ def _attention_forward(
 
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
-    q = (q * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
+    if not POST_SCALE_Q:
+        q = (q * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -77,13 +92,13 @@ def _attention_forward(
         # is bounded to the window band and every tile is masked (the window can
         # cut through what would otherwise be a full unmasked tile).
         if WINDOW_LEFT >= 0:
-            win_lo = tl.maximum(block_m_idx * BLOCK_M - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
+            win_lo = tl.maximum(block_m_idx * BLOCK_M + causal_offset - WINDOW_LEFT, 0) // BLOCK_N * BLOCK_N
         else:
             win_lo = 0
         if IS_CAUSAL:
             win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset)
         elif WINDOW_RIGHT >= 0:
-            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + WINDOW_RIGHT)
+            win_hi = tl.minimum(seqlen_k, (block_m_idx + 1) * BLOCK_M + causal_offset + WINDOW_RIGHT)
         else:
             win_hi = seqlen_k
         acc, l_i, m_i = _attention_inner(
@@ -91,6 +106,8 @@ def _attention_forward(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, win_lo, win_hi, seqlen_k, seqlen_q,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V, WINDOW_LEFT, WINDOW_RIGHT,
+            SAFE_SOFTMAX=SAFE_SOFTMAX,
+            softmax_scale=softmax_scale, POST_SCALE_Q=POST_SCALE_Q,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -112,6 +129,8 @@ def _attention_forward(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, 0, unmasked_n, seqlen_k, seqlen_q,
             BLOCK_N, HEAD_DIM, False, IS_CAUSAL, PRE_LOAD_V,
+            SAFE_SOFTMAX=SAFE_SOFTMAX,
+            softmax_scale=softmax_scale, POST_SCALE_Q=POST_SCALE_Q,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,
@@ -122,6 +141,8 @@ def _attention_forward(
             stride_kn, stride_kd, stride_vn, stride_vd,
             offs_m, offs_d, unmasked_n, max_n, seqlen_k, seqlen_q,
             BLOCK_N, HEAD_DIM, True, IS_CAUSAL, PRE_LOAD_V,
+            SAFE_SOFTMAX=SAFE_SOFTMAX,
+            softmax_scale=softmax_scale, POST_SCALE_Q=POST_SCALE_Q,
             softcap=softcap, HAS_SOFTCAP=HAS_SOFTCAP,
             bias_base=bias_base, stride_bm=stride_bm, stride_bn=stride_bn, HAS_BIAS=HAS_BIAS,
             alibi_slope=alibi_slope, HAS_ALIBI=HAS_ALIBI,

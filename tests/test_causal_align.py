@@ -22,7 +22,10 @@ def reference_br_causal(query, key, value, scale):
     col = torch.arange(sk, device=DEVICE)[None, :]
     keep = (row + (sk - sq)) >= col
     logits = logits.masked_fill(~keep, float("-inf"))
-    return torch.matmul(torch.softmax(logits, dim=-1).to(value.dtype), value)
+    valid = keep.any(dim=-1, keepdim=True)
+    logits = torch.where(valid, logits, torch.zeros_like(logits))
+    probs = torch.where(valid, torch.softmax(logits, dim=-1), 0.0)
+    return torch.matmul(probs.to(value.dtype), value)
 
 
 def grads(fn, q, k, v, dout):
@@ -34,7 +37,10 @@ def grads(fn, q, k, v, dout):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 384), (64, 256), (1, 256), (200, 200), (333, 512)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [
+    (128, 384), (64, 256), (1, 256), (200, 200), (333, 512),
+    (384, 128), (256, 64),
+])
 def test_br_causal_forward(dtype, seqlen_q, seqlen_k):
     torch.manual_seed(seqlen_q + seqlen_k)
     batch, heads, head_dim = 2, 4, 64
@@ -51,7 +57,7 @@ def test_br_causal_forward(dtype, seqlen_q, seqlen_k):
     assert ke <= 2.0 * ne + 1e-3, f"err {ke:.2e} vs naive {ne:.2e}"
 
 
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 384), (200, 200)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 384), (200, 200), (384, 128)])
 def test_br_causal_backward(seqlen_q, seqlen_k):
     torch.manual_seed(seqlen_q + seqlen_k)
     batch, heads, head_dim, dtype = 2, 4, 64, torch.float16

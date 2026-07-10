@@ -73,7 +73,7 @@ def test_lse_matches_logsumexp():
     key = torch.randn(shape, device=DEVICE, dtype=torch.float16)
     value = torch.randn(shape, device=DEVICE, dtype=torch.float16)
 
-    _, lse = _forward(query, key, value, False, scale)
+    _, lse = _forward(query, key, value, False, scale, (-1, -1), 0.0, None, None, 0.0, 0)
     logits = torch.matmul(query.float(), key.float().transpose(-1, -2)) * scale
     expected = torch.logsumexp(logits, dim=-1)
     torch.testing.assert_close(lse, expected, atol=2e-2, rtol=2e-2)

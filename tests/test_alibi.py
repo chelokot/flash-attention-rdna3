@@ -1,4 +1,4 @@
-"""ALiBi: per-head linear positional bias slope * (key_pos - query_pos).
+"""ALiBi: per-head linear positional bias -slope * abs(query_pos - key_pos).
 
 Convention follows Press et al. (2021) / Dao-AILab/flash-attention.
 """
@@ -13,12 +13,19 @@ from fa_rdna3 import flash_attention, alibi_slopes
 DEVICE = "cuda"
 
 
+@pytest.mark.parametrize("n_heads", [0, -1, 1.5, True])
+def test_alibi_slopes_rejects_invalid_head_count(n_heads):
+    with pytest.raises(ValueError, match="positive integer"):
+        alibi_slopes(n_heads, device="cpu")
+
+
 def reference_alibi(query, key, value, scale, slopes, causal):
     sq, sk = query.shape[-2], key.shape[-2]
     logits = (torch.matmul(query, key.transpose(-1, -2)) * scale).float()
     row = torch.arange(sq, device=DEVICE)[:, None]
     col = torch.arange(sk, device=DEVICE)[None, :]
-    logits = logits + slopes.view(1, -1, 1, 1) * (col - row - (sk - sq)).float()
+    distance = (col - row - (sk - sq)).abs().float()
+    logits = logits - slopes.view(1, -1, 1, 1) * distance
     if causal:
         logits = logits.masked_fill((row + (sk - sq)) < col, float("-inf"))
     return torch.matmul(torch.softmax(logits, dim=-1).to(value.dtype), value)
