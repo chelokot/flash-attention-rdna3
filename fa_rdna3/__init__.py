@@ -8,6 +8,11 @@ from .interface import (
     flash_attention_decode_paged,
     alibi_slopes,
 )
+from .sdpa import (
+    disable_rdna3_flash_attention,
+    enable_rdna3_flash_attention,
+    use_rdna3_flash_attention,
+)
 
 __all__ = [
     "flash_attention",
@@ -17,4 +22,7 @@ __all__ = [
     "alibi_slopes",
     "is_available",
     "unsupported_reason",
+    "enable_rdna3_flash_attention",
+    "disable_rdna3_flash_attention",
+    "use_rdna3_flash_attention",
 ]

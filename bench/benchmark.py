@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from fa_rdna3 import flash_attention
+from fa_rdna3.comfyui import ComfyUIAttentionOverride
 
 
 def timed(fn, iters=50, warmup=10):
@@ -39,11 +40,61 @@ def tflops(flops, ms):
     return flops / (ms * 1e-3) / 1e12
 
 
+def benchmark_comfyui(dtype):
+    batch, heads, seqlen_q, head_dim = 2, 8, 4096, 64
+    override = ComfyUIAttentionOverride()
+
+    def unsupported(*args, **kwargs):
+        raise RuntimeError("RDNA3 benchmark unexpectedly fell back")
+
+    print(f"{'shape':>30} {'node ms':>9} {'torch ms':>9} {'speedup':>9} {'max diff':>10}")
+    for seqlen_k in (77, 4096):
+        query = torch.randn(
+            batch, seqlen_q, heads * head_dim,
+            device="cuda", dtype=dtype,
+        )
+        key = torch.randn(
+            batch, seqlen_k, heads * head_dim,
+            device="cuda", dtype=dtype,
+        )
+        value = torch.randn_like(key)
+
+        def torch_attention():
+            query_heads = query.reshape(
+                batch, seqlen_q, heads, head_dim).transpose(1, 2)
+            key_heads = key.reshape(
+                batch, seqlen_k, heads, head_dim).transpose(1, 2)
+            value_heads = value.reshape(
+                batch, seqlen_k, heads, head_dim).transpose(1, 2)
+            output = F.scaled_dot_product_attention(
+                query_heads, key_heads, value_heads)
+            return output.transpose(1, 2).reshape(
+                batch, seqlen_q, heads * head_dim)
+
+        def rdna3_attention():
+            return override(unsupported, query, key, value, heads)
+
+        reference = torch_attention()
+        actual = rdna3_attention()
+        node_ms = timed(rdna3_attention)
+        torch_ms = timed(torch_attention)
+        max_diff = float((actual.float() - reference.float()).abs().max())
+        label = f"b{batch} h{heads} q{seqlen_q} k{seqlen_k} d{head_dim}"
+        print(
+            f"{label:>30} {node_ms:>9.3f} {torch_ms:>9.3f} "
+            f"{torch_ms / node_ms:>8.2f}x {max_diff:>10.4g}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
+    parser.add_argument("--comfyui", action="store_true")
     args = parser.parse_args()
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    if args.comfyui:
+        benchmark_comfyui(dtype)
+        return
 
     print(f"{'shape':>28} {'causal':>7} {'fwd ms':>8} {'fwd TF/s':>9} "
           f"{'bwd ms':>8} {'bwd TF/s':>9} {'vs torch':>9}")

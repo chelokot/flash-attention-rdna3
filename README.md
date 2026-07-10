@@ -99,10 +99,11 @@ that bound.
 
 ## Installation
 
-Install a matching ROCm build of PyTorch first. Its `pytorch-triton-rocm`
-package provides the Triton compiler that matches that PyTorch/ROCm release;
-`fa-rdna3` deliberately does not ask pip to install a second, potentially
-incompatible Triton distribution over it.
+Install a matching ROCm build of PyTorch 2.8 or newer first. Its
+`pytorch-triton-rocm` package provides the matching Triton compiler. `fa-rdna3`
+deliberately declares neither package as an automatic dependency, preventing
+pip or ComfyUI Manager from replacing a working ROCm stack with generic PyPI
+wheels.
 
 The currently verified stack is Python 3.14, PyTorch 2.9.1 + ROCm 6.4, and
 `pytorch-triton-rocm` 3.5.1 on `gfx1100`. Verify the environment, then install:
@@ -111,6 +112,45 @@ The currently verified stack is Python 3.14, PyTorch 2.9.1 + ROCm 6.4, and
 python -c 'import torch, triton; print(torch.__version__, torch.version.hip, triton.__version__)'
 pip install -e .
 ```
+
+### ComfyUI custom node
+
+The repository is directly installable as a ComfyUI custom node; it does not
+need a wrapper repository or a second Triton installation:
+
+```bash
+cd /path/to/ComfyUI/custom_nodes
+git clone https://github.com/chelokot/flash-attention-rdna3.git RDNA3-Flash-Attention
+```
+
+Restart ComfyUI, then insert **RDNA3 Flash Attention** between the checkpoint /
+diffusion-model loader and the sampler. It appears under
+`model_patches/attention` and returns a patched `MODEL`.
+
+The node uses ComfyUI's per-model attention override, so no
+`--use-pytorch-cross-attention` launch flag is required. It also installs the
+safe process-wide SDPA dispatcher for model components that call PyTorch
+directly. Unsupported calls keep using ComfyUI/PyTorch, existing attention
+overrides remain outermost and can delegate to the RDNA3 backend, and
+non-`gfx1100` systems are rejected with a clear error. ComfyUI 0.4.0 or newer
+is required. The first execution of a new shape compiles and caches its Triton
+specialization, so it is slower than subsequent generations.
+
+Semantic overrides are preserved. A backend-selection override that deliberately
+does not delegate (for example, a SageAttention selector) keeps precedence;
+remove that conflicting backend node when you want RDNA3 to handle the call.
+
+Backend-level timings through the actual ComfyUI tensor-layout adapter on the
+verified RX 7900 XTX stack (fp16, `B=2`, `H=8`, `Q=4096`, `D=64`):
+
+| attention | RDNA3 node path | stock PyTorch SDPA | speedup |
+|---|---:|---:|---:|
+| cross, `K=77` | 0.185 ms | 0.880 ms | 4.75× |
+| self, `K=4096` | 1.838 ms | 14.378 ms | 7.82× |
+
+These are attention-call timings, not an end-to-end generation claim; total
+speedup depends on the model, resolution, sampler, offloading, and time spent
+outside attention.
 
 ## Usage
 
@@ -167,13 +207,13 @@ end at the packed token totals; each `max_seqlen` must cover its longest
 segment. Kernels clamp intervals to the packed storage bounds for memory safety,
 but invalid metadata does not produce meaningful attention results.
 
-Transparent drop-in for ComfyUI / diffusers / transformers — installs an
+Transparent Python drop-in for diffusers / transformers — installs an
 override of `torch.nn.functional.scaled_dot_product_attention` (float or
 boolean `attn_mask` is routed as an additive bias) and defers to the original
 for anything unsupported (dropout, head dims above 512):
 
 ```python
-from fa_rdna3.sdpa import enable_rdna3_flash_attention
+from fa_rdna3 import enable_rdna3_flash_attention
 
 enable_rdna3_flash_attention()  # call once at startup
 ```
@@ -203,6 +243,7 @@ enable_rdna3_flash_attention()  # call once at startup
 pip install -e ".[test]"
 python -m pytest tests/            # forward, backward, and decode vs fp32 reference
 python bench/benchmark.py          # forward + backward, vs default SDPA
+python bench/benchmark.py --comfyui  # ComfyUI-layout self/cross attention
 python bench/decode_benchmark.py   # split-K decode, vs forward and SDPA
 python bench/paged_decode_benchmark.py  # paged split-K vs a serial cache walk
 python bench/gemm_ceiling.py       # sustained WMMA GEMM ceiling on this card

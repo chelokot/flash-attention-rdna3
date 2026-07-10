@@ -9,6 +9,8 @@ import torch
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 SUPPORTED_HEAD_DIMS = (16, 32, 64, 128, 256, 512)
 LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+_MIN_TORCH_VERSION = (2, 8)
+_TORCH_VERSION = tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2])
 
 
 @lru_cache(maxsize=None)
@@ -18,6 +20,8 @@ def _device_arch(device_index):
 
 
 def unsupported_reason(device=None):
+    if _TORCH_VERSION < _MIN_TORCH_VERSION:
+        return "fa-rdna3 requires PyTorch 2.8 or newer"
     if device is not None:
         device = torch.device(device)
     if torch.version.hip is None:

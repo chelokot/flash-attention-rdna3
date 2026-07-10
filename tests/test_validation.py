@@ -32,6 +32,11 @@ def test_platform_detection_distinguishes_rocm_architectures(monkeypatch):
     assert "ROCm" in validation.unsupported_reason(torch.device("cuda:0"))
 
 
+def test_platform_detection_rejects_old_torch(monkeypatch):
+    monkeypatch.setattr(validation, "_TORCH_VERSION", (2, 7))
+    assert validation.unsupported_reason() == "fa-rdna3 requires PyTorch 2.8 or newer"
+
+
 @pytest.mark.parametrize(
     "mutate,match",
     [

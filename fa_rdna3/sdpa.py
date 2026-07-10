@@ -7,6 +7,7 @@ cases it supports, and defers to the original implementation otherwise.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 from numbers import Real
 import threading
@@ -21,6 +22,7 @@ _original_sdpa = None
 _patch_lock = threading.RLock()
 _context_depth = 0
 _context_installed = False
+_dispatch_bypassed = ContextVar("fa_rdna3_dispatch_bypassed", default=False)
 
 # Below this many query rows against a long enough cache, split-K decode wins by
 # fanning the cache across the GPU instead of one workgroup per (batch, head).
@@ -102,6 +104,12 @@ def _mask_to_bias(attn_mask):
 
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
+    if _dispatch_bypassed.get():
+        if _original_sdpa is None:
+            raise RuntimeError("RDNA3 SDPA bypass requires an installed dispatcher")
+        return _original_sdpa(
+            query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
     if (_is_supported(query, key, value, attn_mask, dropout_p, enable_gqa, scale)
             and (not is_causal
                  or (attn_mask is None and query.shape[-2] == key.shape[-2]))):
@@ -138,6 +146,15 @@ def disable_rdna3_flash_attention():
     with _patch_lock:
         if _original_sdpa is not None and F.scaled_dot_product_attention is _dispatch_sdpa:
             F.scaled_dot_product_attention = _original_sdpa
+
+
+@contextmanager
+def _bypass_rdna3_flash_attention():
+    token = _dispatch_bypassed.set(True)
+    try:
+        yield
+    finally:
+        _dispatch_bypassed.reset(token)
 
 
 @contextmanager

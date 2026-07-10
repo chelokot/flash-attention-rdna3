@@ -1,11 +1,20 @@
 [project]
 name = "fa-rdna3"
-version = "0.1.0"
+version = "0.2.0"
 description = "FlashAttention-2 Triton kernel for AMD RDNA3 (gfx1100 / Radeon RX 7900 XT/XTX/GRE)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["torch>=2.8"]
+dependencies = []
+classifiers = [
+    "Environment :: GPU :: AMD ROCm",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/chelokot/flash-attention-rdna3"
+"Bug Tracker" = "https://github.com/chelokot/flash-attention-rdna3/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "ruff>=0.12"]
@@ -19,3 +28,8 @@ include = ["fa_rdna3*"]
 
 [tool.ruff.lint]
 ignore = ["E731"]
+
+[tool.comfy]
+PublisherId = "chelokot"
+DisplayName = "RDNA3 Flash Attention"
+requires-comfyui = ">=0.4.0"
