@@ -1,4 +1,4 @@
-"""Sweep dK/dV or dQ tile geometries for head-dim-64 attention."""
+"""Sweep dK/dV or dQ tile geometries for attention backward."""
 
 import argparse
 import math
@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=4096)
     parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--block-m", type=int)
@@ -47,12 +48,12 @@ def main():
         parser.error("--block-m, --block-n and --num-warps must be provided together")
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
-    shape = (args.batch, args.heads, args.seqlen, 64)
+    shape = (args.batch, args.heads, args.seqlen, args.head_dim)
     query = torch.randn(shape, device="cuda", dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     dout = torch.randn_like(query)
-    scale = 1.0 / math.sqrt(64)
+    scale = 1.0 / math.sqrt(args.head_dim)
     out, lse = interface._forward(
         query, key, value, args.causal, scale, (-1, -1), 0.0, None, None, 0.0, 0)
 

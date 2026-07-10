@@ -46,6 +46,16 @@ _D64_NONCAUSAL_NARROW_GEOMETRY = (64, 16, 4)
 _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY = (32, 64, 2)
 _D64_BACKWARD_DKDV_GEOMETRY = (16, 32, 2)
 _D64_BACKWARD_DQ_GEOMETRY = (64, 16, 4)
+_D128_BACKWARD_DKDV_GEOMETRY = (16, 64, 4)
+_D128_BACKWARD_DQ_GEOMETRY = (32, 16, 2)
+_BACKWARD_DKDV_SPECIALIZATIONS = {
+    64: _D64_BACKWARD_DKDV_GEOMETRY,
+    128: _D128_BACKWARD_DKDV_GEOMETRY,
+}
+_BACKWARD_DQ_SPECIALIZATIONS = {
+    64: _D64_BACKWARD_DQ_GEOMETRY,
+    128: _D128_BACKWARD_DQ_GEOMETRY,
+}
 
 
 # The exhaustive grid remains in bench/config_sweep.py. Production keeps every
@@ -77,26 +87,26 @@ def _fwd_configs(include_d64_specializations=True):
     return _configs_from_geometries(geometries)
 
 
-def _bwd_dkdv_configs(include_d64_specialization=True):
+def _bwd_dkdv_configs(include_specializations=True):
     geometries = (
         (64, 32, 2), (64, 32, 4), (64, 32, 8),
         (64, 64, 2), (64, 64, 8),
         (64, 128, 4), (64, 128, 8),
         (128, 64, 4),
     )
-    if include_d64_specialization:
-        geometries = (_D64_BACKWARD_DKDV_GEOMETRY,) + geometries
+    if include_specializations:
+        geometries = tuple(_BACKWARD_DKDV_SPECIALIZATIONS.values()) + geometries
     return _configs_from_geometries(geometries)
 
 
-def _bwd_dq_configs(include_d64_specialization=True):
+def _bwd_dq_configs(include_specializations=True):
     geometries = (
         (64, 32, 2), (64, 32, 4), (64, 32, 8),
         (64, 64, 2), (64, 64, 8),
         (128, 32, 4), (128, 32, 8),
     )
-    if include_d64_specialization:
-        geometries = (_D64_BACKWARD_DQ_GEOMETRY,) + geometries
+    if include_specializations:
+        geometries = tuple(_BACKWARD_DQ_SPECIALIZATIONS.values()) + geometries
     return _configs_from_geometries(geometries)
 
 
@@ -163,7 +173,7 @@ def _prune_configs_by_head_dim(configs, named_args, **kwargs):
     return kept or configs
 
 
-def _prune_backward_configs(configs, named_args, d64_geometry, **kwargs):
+def _prune_backward_configs(configs, named_args, specializations, **kwargs):
     query = named_args.get("q_ptr")
     if query is not None and query.element_size() == 4:
         return [config for config in configs if (
@@ -172,10 +182,11 @@ def _prune_backward_configs(configs, named_args, d64_geometry, **kwargs):
     head_dim = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
     seqlen_q = named_args.get("seqlen_q")
     seqlen_k = named_args.get("seqlen_k")
-    plain_dense_d64 = (
+    specialization = specializations.get(head_dim)
+    plain_dense_low_precision = (
         query is not None
         and query.element_size() == 2
-        and head_dim == 64
+        and specialization is not None
         and seqlen_q is not None
         and seqlen_q == seqlen_k
         and seqlen_q >= 128
@@ -188,24 +199,25 @@ def _prune_backward_configs(configs, named_args, d64_geometry, **kwargs):
         and not kwargs.get("DROPOUT", named_args.get("DROPOUT", False))
         and not kwargs.get("SAFE_SOFTMAX", named_args.get("SAFE_SOFTMAX", False))
     )
-    if plain_dense_d64:
+    if plain_dense_low_precision:
         return [config for config in configs if (
             config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
-        ) == d64_geometry]
+        ) == specialization]
+    specialization_geometries = set(specializations.values())
     kept = [config for config in configs if (
         config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
-    ) != d64_geometry]
+    ) not in specialization_geometries]
     return _prune_configs_by_head_dim(kept, named_args, **kwargs)
 
 
 def _prune_bwd_dkdv_configs(configs, named_args, **kwargs):
     return _prune_backward_configs(
-        configs, named_args, _D64_BACKWARD_DKDV_GEOMETRY, **kwargs)
+        configs, named_args, _BACKWARD_DKDV_SPECIALIZATIONS, **kwargs)
 
 
 def _prune_bwd_dq_configs(configs, named_args, **kwargs):
     return _prune_backward_configs(
-        configs, named_args, _D64_BACKWARD_DQ_GEOMETRY, **kwargs)
+        configs, named_args, _BACKWARD_DQ_SPECIALIZATIONS, **kwargs)
 
 
 def _split_configs():

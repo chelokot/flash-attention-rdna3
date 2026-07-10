@@ -55,12 +55,14 @@ faster over the same lengths. Outputs match AOTriton to within fp16 tolerance
 (max abs diff ≤ 2.44e-4), an independent cross-check on top of the fp32
 reference tests.
 
-The same comparison for the complete D64 backward pass (dQ + dK + dV):
+The same comparison for the complete backward pass (dQ + dK + dV):
 
 | shape | causal | this kernel | AOTriton | speedup |
 |---|---|---:|---:|---:|
 | 1 × 16 × 4096 × 64 | no  | 3.922 ms | 5.291 ms | 1.35× |
 | 1 × 16 × 4096 × 64 | yes | 2.270 ms | 3.705 ms | 1.63× |
+| 1 × 16 × 2048 × 128 | no  | 4.568 ms | 4.945 ms | 1.08× |
+| 1 × 16 × 2048 × 128 | yes | 2.524 ms | 3.121 ms | 1.24× |
 
 ### Decode (single query row, long KV cache)
 
@@ -206,8 +208,8 @@ python bench/paged_decode_benchmark.py  # paged split-K vs a serial cache walk
 python bench/gemm_ceiling.py       # sustained WMMA GEMM ceiling on this card
 python bench/config_sweep.py       # correctness of every forward tile config
 python bench/noncausal_d64_sweep.py  # D64 forward geometry timings + correctness
-python -m bench.backward_d64_sweep dkdv  # D64 backward geometry timings + stability
-python -m bench.backward_d64_sweep dq
+python -m bench.backward_sweep dkdv  # backward geometry timings + stability
+python -m bench.backward_sweep dq --head-dim 128
 ```
 
 `config_sweep.py` exists because three `(tile, num_warps)` geometries
@@ -232,14 +234,15 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
 - Autotuned block sizes over a grid sized for RDNA3's 32-lane WMMA fragments and
   the 64 KB per-workgroup LDS limit.
 - The general production grids retain 22 measured candidates (forward 7,
-  dK/dV 8, dQ 7), down from 45. The common D64 path bypasses cold autotuning
-  and compiles one measured geometry per kernel.
+  dK/dV 8, dQ 7), down from 45. The common D64 forward and D64/D128 backward
+  paths bypass cold autotuning and compile one measured geometry per kernel.
 - Plain non-causal D64 uses measured occupancy specializations: `32×64 / 2
   warps` for one batch-head at every length, and `64×16 / 4 warps` from two
   batch-heads up at sequence lengths of 512 or more.
-- Plain dense D64 backward uses `16×32 / 2 warps` for dK/dV and `64×16 / 4
-  warps` for dQ. These stable winners cover both causal modes and fp16/bf16;
-  fp32, GQA, cross-attention, varlen, and score modifiers retain their existing
+- Plain dense backward uses `16×32 / 2 warps` for D64 dK/dV and `64×16 / 4
+  warps` for D64 dQ; D128 uses `16×64 / 4 warps` and `32×16 / 2 warps`.
+  These stable winners cover both causal modes and fp16/bf16; fp32, GQA,
+  cross-attention, varlen, and score modifiers retain their existing
   specialized or autotuned paths.
 - Autotune selections are keyed by dtype, shape, GQA grouping, and enabled score
   modifiers, then cached on disk so a new Python process does not benchmark the
