@@ -28,7 +28,7 @@ def _bounded_sequence(cu_seqlens_ptr, batch_idx, total_tokens):
 
 
 @triton.autotune(
-    configs=_fwd_configs(),
+    configs=_fwd_configs(include_d64_specializations=False),
     key=[
         "max_seqlen_q_bucket", "max_seqlen_k_bucket", "HEAD_DIM", "IS_CAUSAL", "GROUP_SIZE",
         "WINDOW_LEFT", "WINDOW_RIGHT", "HAS_SOFTCAP", "HAS_ALIBI",

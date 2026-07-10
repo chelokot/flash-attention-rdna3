@@ -42,6 +42,8 @@ _MISCOMPILED_BF16_POST_SCALE = {(64, 32, 4)}
 _NONRETURNING_FP32_DKDV = {(64, 128, 4), (64, 128, 8), (128, 64, 4)}
 _NONRETURNING_FP32_DQ = {(64, 64, 2)}
 _FP32_BACKWARD_GEOMETRY = (64, 32, 4)
+_D64_NONCAUSAL_NARROW_GEOMETRY = (64, 16, 4)
+_D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY = (32, 64, 2)
 
 
 # The exhaustive grid remains in bench/config_sweep.py. Production keeps every
@@ -58,13 +60,19 @@ def _configs_from_geometries(geometries):
     ]
 
 
-def _fwd_configs():
-    return _configs_from_geometries((
+def _fwd_configs(include_d64_specializations=True):
+    geometries = (
         (64, 32, 2), (64, 32, 4), (64, 32, 8),
         (64, 64, 8),
         (64, 128, 4), (64, 128, 8),
         (128, 32, 8),
-    ))
+    )
+    if include_d64_specializations:
+        geometries = (
+            _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY,
+            _D64_NONCAUSAL_NARROW_GEOMETRY,
+        ) + geometries
+    return _configs_from_geometries(geometries)
 
 
 def _bwd_dkdv_configs():
@@ -96,7 +104,45 @@ _TILE_HEAD_DIM_BUDGET = 32768
 def _prune_configs_by_head_dim(configs, named_args, **kwargs):
     head_dim = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
     post_scale_q = kwargs.get("POST_SCALE_Q", named_args.get("POST_SCALE_Q", False))
-    kept = configs
+    is_causal = kwargs.get("IS_CAUSAL", named_args.get("IS_CAUSAL", False))
+    seqlen_q = named_args.get("seqlen_q")
+    seqlen_k = named_args.get("seqlen_k")
+    query = named_args.get("q_ptr")
+    has_parallelism_bucket = (
+        "PARALLELISM_BUCKET" in kwargs or "PARALLELISM_BUCKET" in named_args)
+    parallelism = kwargs.get(
+        "PARALLELISM_BUCKET", named_args.get("PARALLELISM_BUCKET", 0))
+    plain_d64_noncausal = (
+        has_parallelism_bucket
+        and query is not None
+        and query.element_size() == 2
+        and head_dim == 64
+        and not is_causal
+        and seqlen_q is not None
+        and seqlen_q == seqlen_k
+        and kwargs.get("WINDOW_LEFT", named_args.get("WINDOW_LEFT", -1)) < 0
+        and kwargs.get("WINDOW_RIGHT", named_args.get("WINDOW_RIGHT", -1)) < 0
+        and not kwargs.get("HAS_SOFTCAP", named_args.get("HAS_SOFTCAP", False))
+        and not kwargs.get("HAS_BIAS", named_args.get("HAS_BIAS", False))
+        and not kwargs.get("HAS_ALIBI", named_args.get("HAS_ALIBI", False))
+        and not kwargs.get("DROPOUT", named_args.get("DROPOUT", False))
+        and not kwargs.get("SAFE_SOFTMAX", named_args.get("SAFE_SOFTMAX", False))
+    )
+    if plain_d64_noncausal:
+        if parallelism == 0:
+            return [config for config in configs if (
+                config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
+            ) == _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY]
+        if seqlen_q >= 512:
+            return [config for config in configs if (
+                config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
+            ) == _D64_NONCAUSAL_NARROW_GEOMETRY]
+    kept = [config for config in configs if (
+        config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps
+    ) not in {
+        _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY,
+        _D64_NONCAUSAL_NARROW_GEOMETRY,
+    }]
     if post_scale_q:
         kept = [config for config in kept if (
             config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps

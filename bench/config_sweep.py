@@ -44,6 +44,7 @@ def launch(q, k, v, causal, scale, block_m, block_n, num_warps):
     meta = dict(
         HEAD_DIM=head_dim, BLOCK_M=block_m, BLOCK_N=block_n,
         IS_CAUSAL=causal, GROUP_SIZE=1, POST_SCALE_Q=q.dtype == torch.bfloat16,
+        PARALLELISM_BUCKET=1,
         num_warps=num_warps, num_stages=1)
     kernels._attention_forward.fn[grid](
         *common_args, q, 0, 0, 0, 0, q, 0.0, 0, *shape_args, **meta)

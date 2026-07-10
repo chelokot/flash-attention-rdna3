@@ -12,6 +12,8 @@ from fa_rdna3.kernels import (
     _attention_split,
 )
 from fa_rdna3.kernels._common import (
+    _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY,
+    _D64_NONCAUSAL_NARROW_GEOMETRY,
     _FP32_BACKWARD_GEOMETRY,
     _MISCOMPILED_BF16_POST_SCALE,
     _MISCOMPILED_ON_GFX1100,
@@ -52,12 +54,13 @@ def test_batched_autotune_keys_cover_codegen_features():
     for kernel in (_attention_forward, _attention_bwd_dkdv, _attention_bwd_dq):
         assert required <= set(kernel.keys)
     assert "POST_SCALE_Q" in _attention_forward.keys
+    assert "PARALLELISM_BUCKET" in _attention_forward.keys
     assert "POST_SCALE_Q" in _attention_forward_varlen.keys
 
 
 def test_production_config_spaces_stay_bounded_and_blacklist_free():
     expected_counts = {
-        _attention_forward: 7,
+        _attention_forward: 9,
         _attention_bwd_dkdv: 8,
         _attention_bwd_dq: 7,
         _attention_forward_varlen: 7,
@@ -103,3 +106,48 @@ def test_float32_backward_prunes_nonreturning_geometries():
         }
         assert geometries == {_FP32_BACKWARD_GEOMETRY}
         assert geometries.isdisjoint(blocked)
+
+
+def test_plain_d64_noncausal_uses_measured_parallelism_specialization():
+    common = {
+        "HEAD_DIM": 64,
+        "IS_CAUSAL": False,
+        "seqlen_q": 4096,
+        "seqlen_k": 4096,
+        "q_ptr": torch.empty(1, dtype=torch.float16),
+    }
+    for parallelism, expected in (
+        (0, _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY),
+        (1, _D64_NONCAUSAL_NARROW_GEOMETRY),
+    ):
+        kept = _prune_configs_by_head_dim(
+            _attention_forward.configs,
+            {**common, "PARALLELISM_BUCKET": parallelism},
+        )
+        geometries = {
+            (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+            for config in kept
+        }
+        assert geometries == {expected}
+
+    short = _prune_configs_by_head_dim(
+        _attention_forward.configs,
+        {**common, "seqlen_q": 256, "seqlen_k": 256, "PARALLELISM_BUCKET": 1},
+    )
+    short_geometries = {
+        (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+        for config in short
+    }
+    assert _D64_NONCAUSAL_NARROW_GEOMETRY not in short_geometries
+    assert _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY not in short_geometries
+
+    float32 = _prune_configs_by_head_dim(
+        _attention_forward.configs,
+        {**common, "q_ptr": torch.empty(1, dtype=torch.float32), "PARALLELISM_BUCKET": 1},
+    )
+    float32_geometries = {
+        (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.num_warps)
+        for config in float32
+    }
+    assert _D64_NONCAUSAL_NARROW_GEOMETRY not in float32_geometries
+    assert _D64_NONCAUSAL_LOW_PARALLELISM_GEOMETRY not in float32_geometries

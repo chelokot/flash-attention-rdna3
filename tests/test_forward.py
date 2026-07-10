@@ -64,6 +64,19 @@ def test_head_dims(head_dim):
     torch.testing.assert_close(out.float(), ref, atol=3e-3, rtol=3e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_single_batch_head_d64_specialization(dtype):
+    torch.manual_seed(37)
+    query = torch.randn(1, 1, 1024, 64, device=DEVICE, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    scale = 1.0 / math.sqrt(64)
+
+    out = flash_attention(query, key, value, softmax_scale=scale)
+    ref = reference_attention(query, key, value, False, scale)
+    torch.testing.assert_close(out.float(), ref, atol=tolerance(dtype), rtol=tolerance(dtype))
+
+
 def test_cross_attention_shapes():
     torch.manual_seed(1)
     query = torch.randn(2, 8, 333, 64, device=DEVICE, dtype=torch.float16)

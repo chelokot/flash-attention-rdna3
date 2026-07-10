@@ -43,15 +43,17 @@ experimental flag), same card:
 
 | shape | causal | vs AOTriton |
 |---|---|---|
-| 1 × 16 × 4096 × 64  | no  | 0.86× (≈14% behind) |
+| 1 × 16 × 4096 × 64  | no  | 1.03× faster |
 | 2 × 16 × 2048 × 128 | yes | 1.75× faster |
 | 1 × 24 × 4096 × 128 | yes | 1.63× faster |
 | 1 × 16 × 8192 × 64  | yes | 1.79× faster |
 
-Faster than AOTriton on causal (the loop split skips the masked upper triangle);
-behind it on non-causal head_dim 64, which is the current weak spot. Outputs
-match AOTriton to within fp16 tolerance (max abs diff ≤ 2e-3), an independent
-cross-check on top of the fp32 reference tests.
+Faster than AOTriton on the tested causal shapes and on non-causal head_dim 64.
+The D64 occupancy specializations measure 1.03–1.04× faster at 16 heads for
+sequence lengths 2048–8192; the single-head path ranges from 1.10× to 1.71×
+faster over the same lengths. Outputs match AOTriton to within fp16 tolerance
+(max abs diff ≤ 2.44e-4), an independent cross-check on top of the fp32
+reference tests.
 
 ### Decode (single query row, long KV cache)
 
@@ -196,6 +198,7 @@ python bench/decode_benchmark.py   # split-K decode, vs forward and SDPA
 python bench/paged_decode_benchmark.py  # paged split-K vs a serial cache walk
 python bench/gemm_ceiling.py       # sustained WMMA GEMM ceiling on this card
 python bench/config_sweep.py       # correctness of every forward tile config
+python bench/noncausal_d64_sweep.py  # D64 forward geometry timings + correctness
 ```
 
 `config_sweep.py` exists because three `(tile, num_warps)` geometries
@@ -222,6 +225,9 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
 - The measured production grids cut a training specialization from 45 compiled
   candidates to 22 (forward 15→7, dK/dV 15→8, dQ 15→7), limiting first-use
   latency and Triton disk-cache growth while retaining all observed winners.
+- Plain non-causal D64 uses measured occupancy specializations: `32×64 / 2
+  warps` for one batch-head at every length, and `64×16 / 4 warps` from two
+  batch-heads up at sequence lengths of 512 or more.
 - Autotune selections are keyed by dtype, shape, GQA grouping, and enabled score
   modifiers, then cached on disk so a new Python process does not benchmark the
   same specialization again.

@@ -160,6 +160,7 @@ def _forward(query, key, value, causal, softmax_scale, window, softcap, bias, al
         HEAD_DIM=head_dim,
         IS_CAUSAL=causal,
         GROUP_SIZE=group_size,
+        PARALLELISM_BUCKET=int(batch * heads > 1),
         WINDOW_LEFT=window[0],
         WINDOW_RIGHT=window[1],
         softcap=softcap,
