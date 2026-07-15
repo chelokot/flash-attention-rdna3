@@ -14,6 +14,7 @@ from numbers import Integral
 
 import torch
 import triton
+from torch.library import triton_op, wrap_triton
 
 from ._validation import (
     LOW_PRECISION_DTYPES,
@@ -28,6 +29,7 @@ from ._validation import (
 )
 from .kernels import (
     _attention_forward,
+    _attention_tiny_forward,
     _attention_bwd_preprocess,
     _attention_bwd_dkdv,
     _attention_bwd_dq,
@@ -77,6 +79,29 @@ def _paged_num_splits(batch, heads, block_size, max_blocks, target_programs,
 
 _DTYPE_KEY = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _SUPPORTED_DTYPES = SUPPORTED_DTYPES
+
+
+@triton_op("fa_rdna3::flash_tiny_fwd", mutates_args=())
+def _flash_tiny_fwd(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                    softmax_scale: float, bias: "torch.Tensor | None",
+                    block_n: int) -> torch.Tensor:
+    batch, heads, seqlen, _ = query.shape
+    out = torch.empty_like(query)
+    bias_t, sbb, sbh, sbm, sbn, has_bias = _bias_args(
+        bias, query, batch, heads, seqlen, seqlen)
+    wrap_triton(_attention_tiny_forward)[(seqlen, heads, batch)](
+        query, key, value, out,
+        bias_t, softmax_scale,
+        *query.stride(), *key.stride(), *value.stride(), *out.stride(),
+        sbb, sbh, sbm, sbn,
+        SEQLEN=seqlen,
+        HEAD_DIM=128,
+        BLOCK_N=block_n,
+        HAS_BIAS=has_bias,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
 
 
 def _autotune_seqlen_key(seqlen, dtype):
@@ -308,13 +333,33 @@ def _flash_fwd_backward(ctx, grad_out, grad_lse):
 _flash_fwd.register_autograd(_flash_fwd_backward, setup_context=_flash_fwd_setup_context)
 
 
+def _can_use_tiny_forward(query, key, value, causal, window_size, softcap,
+                          alibi_slopes, dropout_p, head_dim):
+    requires_backward = torch.is_grad_enabled() and (
+        query.requires_grad or key.requires_grad or value.requires_grad)
+    return (
+        not requires_backward
+        and query.dtype == torch.float32
+        and head_dim == 128
+        and query.shape[1] == key.shape[1] == value.shape[1]
+        and query.shape[2] == key.shape[2] == value.shape[2]
+        and query.shape[2] <= 32
+        and not causal
+        and window_size == (-1, -1)
+        and softcap == 0.0
+        and alibi_slopes is None
+        and dropout_p == 0.0
+    )
+
+
 def flash_attention(query, key, value, causal=False, softmax_scale=None, window_size=(-1, -1),
                     softcap=0.0, bias=None, alibi_slopes=None, dropout_p=0.0):
     """Compute scaled dot-product attention with the RDNA3 Triton kernel.
 
     Args:
         query, key, value: tensors shaped ``(batch, heads, seqlen, head_dim)``
-            in float16 or bfloat16. Key and value share the key sequence length.
+            in float16, bfloat16, or float32. Key and value share the key
+            sequence length.
         causal: apply a causal mask over the query/key positions.
         softmax_scale: scale applied to the logits; defaults to ``1/sqrt(head_dim)``.
         window_size: ``(left, right)`` sliding window — query ``i`` attends keys
@@ -350,6 +395,13 @@ def flash_attention(query, key, value, causal=False, softmax_scale=None, window_
     window_size = tuple(window_size)
     softcap = float(softcap)
     dropout_p = float(dropout_p)
+
+    if _can_use_tiny_forward(
+            query, key, value, causal, window_size, softcap,
+            alibi_slopes, dropout_p, head_dim):
+        seqlen = query.shape[2]
+        block_n = 8 if seqlen <= 8 else 16 if seqlen <= 16 else 32
+        return _flash_tiny_fwd(query, key, value, softmax_scale, bias, block_n)
 
     # Non-power-of-two head_dim: pad q/k/v to the next supported size with zeros
     # (which contribute nothing to q.k^T or p.v) and slice the output back. The

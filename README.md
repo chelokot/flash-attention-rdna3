@@ -64,6 +64,32 @@ The same comparison for the complete backward pass (dQ + dK + dV):
 | 1 × 16 × 2048 × 128 | no  | 4.568 ms | 4.945 ms | 1.08× |
 | 1 × 16 × 2048 × 128 | yes | 2.524 ms | 3.121 ms | 1.24× |
 
+### Short FP32 runtime attention
+
+Interactive motion models exercise the opposite end of the shape range: many
+non-causal FP32 attention calls with only a few tokens. A dedicated inference
+kernel now handles self-attention with `head_dim=128` and sequence lengths up
+to 32. One 32-lane wave computes each query row, keeps its logits and output in
+registers, and omits the log-sum-exp state needed by backward.
+
+Compiled-call timings on the verified RX 7900 XTX / Python 3.12 stack,
+including dispatch overhead and a broadcast additive mask, against PyTorch's
+experimental AOTriton backend:
+
+| shape (batch × heads × seqlen × dim) | PyTorch SDPA | this kernel | speedup |
+|---|---:|---:|---:|
+| 2 × 8 × 6 × 128  | 110.95 µs | 92.55 µs | 1.20× |
+| 2 × 8 × 19 × 128 | 115.53 µs | 94.88 µs | 1.22× |
+
+In a noisy ARDY four-step replan benchmark with 64 attention calls, observed
+end-to-end medians moved from 39.86 to 39.46 ms for steady WASD motion and from
+41.25 to 41.01 ms for a 64-frame waypoint constraint. Stock and custom calls
+were alternated in one loaded process over 200 repetitions. The paired
+bootstrap 95% intervals crossed zero, so these end-to-end results should be
+treated as parity rather than a claimed speedup. Direct and compiled kernel
+outputs match the FP32 reference with max absolute error below `2e-6` across
+sequence lengths 1, 6, 19, and 32, including fully masked rows.
+
 ### Decode (single query row, long KV cache)
 
 Split-K decode against the plain forward on the same card, fp16, head_dim 128:
@@ -105,8 +131,10 @@ deliberately declares neither package as an automatic dependency, preventing
 pip or ComfyUI Manager from replacing a working ROCm stack with generic PyPI
 wheels.
 
-The currently verified stack is Python 3.14, PyTorch 2.9.1 + ROCm 6.4, and
-`pytorch-triton-rocm` 3.5.1 on `gfx1100`. Verify the environment, then install:
+The eager API and full test suite are verified with Python 3.14, PyTorch 2.9.1
+for ROCm 6.4, and `pytorch-triton-rocm` 3.5.1 on `gfx1100`. The compiled short
+attention path and ARDY benchmarks are additionally verified with the same
+Torch/ROCm/Triton stack under Python 3.12. Verify the environment, then install:
 
 ```bash
 python -c 'import torch, triton; print(torch.__version__, torch.version.hip, triton.__version__)'
@@ -154,7 +182,7 @@ outside attention.
 
 ## Usage
 
-Direct call — tensors are `(batch, heads, seqlen, head_dim)`, fp16 or bf16.
+Direct call — tensors are `(batch, heads, seqlen, head_dim)`, fp16, bf16, or fp32.
 Differentiable, so it works inside training:
 
 ```python
@@ -218,11 +246,18 @@ from fa_rdna3 import enable_rdna3_flash_attention
 enable_rdna3_flash_attention()  # call once at startup
 ```
 
+Under `torch.compile`, eligible short FP32 calls are specialized to their exact
+sequence length and lowered through a transparent `torch.library.triton_op`.
+This removes PyTorch's score-mask padding kernels without graph breaks. It does
+not require the AOTriton experimental environment flag.
+
 ## Supported
 
 - Dense head dims up to 512 (incl. non-powers-of-two, zero-padded internally);
   packed and decode APIs use exact power-of-two dims from 16 through 512
 - Dense fp16, bf16, and fp32; packed/decode fp16 and bf16
+- Specialized compiled FP32 inference for non-causal D128 self-attention with
+  sequence lengths up to 32
 - Causal (bottom-right aligned for `seqlen_q != seqlen_k`) and full attention
 - Sliding-window / local attention (`window_size=(left, right)`, e.g. Mistral)
 - Logit soft-capping (`softcap`, e.g. Gemma2)
@@ -246,6 +281,7 @@ python bench/benchmark.py          # forward + backward, vs default SDPA
 python bench/benchmark.py --comfyui  # ComfyUI-layout self/cross attention
 python bench/decode_benchmark.py   # split-K decode, vs forward and SDPA
 python bench/paged_decode_benchmark.py  # paged split-K vs a serial cache walk
+python bench/tiny_inference.py  # compiled short FP32 inference vs AOTriton
 python bench/gemm_ceiling.py       # sustained WMMA GEMM ceiling on this card
 python bench/config_sweep.py       # correctness of every forward tile config
 python bench/noncausal_d64_sweep.py  # D64 forward geometry timings + correctness
@@ -318,6 +354,8 @@ never materialised. RDNA3-specific choices live in `fa_rdna3/kernels/`:
   split count from both GPU occupancy and serial work per program.
 - Low-precision additive bias is consumed directly by the kernel; it is never
   expanded or copied into a materialised fp32 attention matrix.
+- Short FP32 inference uses one wave per query row and an exact static key loop;
+  it performs a two-pass register softmax and returns zero for fully masked rows.
 
 ## Acknowledgements
 

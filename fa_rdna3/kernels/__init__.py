@@ -2,6 +2,7 @@
 
 from ._common import _attention_inner, _bwd_dkdv_inner, _bwd_dq_inner
 from .forward import _attention_forward
+from .tiny import _attention_tiny_forward
 from .backward import (
     _attention_bwd_preprocess,
     _attention_bwd_dkdv,
@@ -21,6 +22,7 @@ __all__ = [
     "_bwd_dkdv_inner",
     "_bwd_dq_inner",
     "_attention_forward",
+    "_attention_tiny_forward",
     "_attention_bwd_preprocess",
     "_attention_bwd_dkdv",
     "_attention_bwd_dq",

@@ -7,7 +7,6 @@ cases it supports, and defers to the original implementation otherwise.
 """
 
 from contextlib import contextmanager
-from contextvars import ContextVar
 import math
 from numbers import Real
 import threading
@@ -22,7 +21,7 @@ _original_sdpa = None
 _patch_lock = threading.RLock()
 _context_depth = 0
 _context_installed = False
-_dispatch_bypassed = ContextVar("fa_rdna3_dispatch_bypassed", default=False)
+_dispatch_bypass_state = threading.local()
 
 # Below this many query rows against a long enough cache, split-K decode wins by
 # fanning the cache across the GPU instead of one workgroup per (batch, head).
@@ -36,6 +35,18 @@ _DECODE_MIN_KEY = 1024
 # math backward is cheap and stable at this size — unlike its large-S path, which
 # is the erratic one we exist to replace, so the threshold stays deliberately low.
 _MIN_TRAIN_SEQLEN = 16
+
+
+def _is_tiny_fp32_inference(query, key, value, attn_mask, is_causal, requires_backward):
+    return (
+        not requires_backward
+        and not is_causal
+        and query.dtype == torch.float32
+        and query.shape[-1] == 128
+        and query.shape == key.shape == value.shape
+        and query.shape[-2] <= 32
+        and (attn_mask is None or attn_mask.dtype == torch.float32)
+    )
 
 
 def _is_supported_mask(attn_mask, query, key):
@@ -104,7 +115,7 @@ def _mask_to_bias(attn_mask):
 
 def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                   is_causal=False, scale=None, enable_gqa=False):
-    if _dispatch_bypassed.get():
+    if getattr(_dispatch_bypass_state, "depth", 0):
         if _original_sdpa is None:
             raise RuntimeError("RDNA3 SDPA bypass requires an installed dispatcher")
         return _original_sdpa(
@@ -115,6 +126,14 @@ def _dispatch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                  or (attn_mask is None and query.shape[-2] == key.shape[-2]))):
         requires_backward = torch.is_grad_enabled() and (
             query.requires_grad or key.requires_grad or value.requires_grad)
+        if (_is_tiny_fp32_inference(
+                query, key, value, attn_mask, is_causal, requires_backward)
+                and torch.compiler.is_compiling()):
+            torch._dynamo.mark_static(query, 2)
+            torch._dynamo.mark_static(key, 2)
+            torch._dynamo.mark_static(value, 2)
+            bias = _mask_to_bias(attn_mask)
+            return flash_attention(query, key, value, softmax_scale=scale, bias=bias)
         if (requires_backward
                 and query.shape[-2] <= _MIN_TRAIN_SEQLEN and key.shape[-2] <= _MIN_TRAIN_SEQLEN):
             return _original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
@@ -150,11 +169,12 @@ def disable_rdna3_flash_attention():
 
 @contextmanager
 def _bypass_rdna3_flash_attention():
-    token = _dispatch_bypassed.set(True)
+    depth = getattr(_dispatch_bypass_state, "depth", 0)
+    _dispatch_bypass_state.depth = depth + 1
     try:
         yield
     finally:
-        _dispatch_bypassed.reset(token)
+        _dispatch_bypass_state.depth = depth
 
 
 @contextmanager
